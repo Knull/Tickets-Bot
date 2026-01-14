@@ -65,3 +65,4 @@ model TicketBlacklist {
   expiresAt DateTime?
   createdAt DateTime @default(now())
 }
+
