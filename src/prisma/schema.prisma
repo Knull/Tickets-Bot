@@ -2,66 +2,75 @@
 // this is quite an important file, do not modify this unless you know what you're doing.
 datasource db {
   provider = "postgresql"
-  url      = env("DATABASE_URL")
 }
 
 generator client {
-  provider = "prisma-client-js"
+  provider = "prisma-client"
+  output   = "../generated/prisma"
 }
 
 model Ticket {
-  id              Int       @id @default(autoincrement())
-  ticketNumber    Int
-  ticketType      String
-  status          String    // e.g., "open", "closed", "claimed", "deleted"
-  channelId       String
-  userId          String
-  ticketMessageId String?
-  reason          String?
-  reportedUser    String?
-  inviteLink      String?
-  proofUrls       Json?
-  transcriptUrl   String?
-  lastMessageAt   DateTime?
-  createdAt       DateTime  @default(now())
-  updatedAt       DateTime  @updatedAt
-  added_user      Json?
-  added_roles     Json?
-  duration        Int?
-  outsideMessageId  String?
-  logMessageUrl   String?
+  id               Int       @id @default(autoincrement())
+  ticketNumber     Int
+  ticketType       String
+  status           String // e.g., "open", "closed", "claimed", "deleted"
+  channelId        String
+  userId           String
+  ticketMessageId  String?
+  reason           String?
+  reportedUser     String?
+  inviteLink       String?
+  proofUrls        Json?
+  transcriptUrl    String?
+  lastMessageAt    DateTime?
+  createdAt        DateTime  @default(now())
+  updatedAt        DateTime  @updatedAt
+  added_user       Json?
+  added_roles      Json?
+  duration         Int?
+  outsideMessageId String?
+  logMessageUrl    String?
+
+  @@index([channelId])
+  @@index([userId, status, createdAt])
+  @@index([status, lastMessageAt])
+  @@index([status, createdAt])
 }
 
 model TicketSettings {
-  id            Int  @id @default(1)
+  id            Int     @id @default(1)
   ticketCounter Int
+  mode          String  @default("channel")
+  pingRoles     Boolean @default(false)
 }
 
 model PlayerProfile {
-  id            Int      @id @default(autoincrement())
-  discordUserId String   @unique
+  id            Int       @id @default(autoincrement())
+  discordUserId String    @unique
   ign           String
   lastSeen      DateTime?
   ranks         Json?
   clanName      String?
   rankInfo      Json?
   friends       Json?
-  createdAt     DateTime @default(now())
+  createdAt     DateTime  @default(now())
 }
 
 model TicketConfig {
-  id                    Int      @id @default(autoincrement())
-  ticketType            String   @unique
-  permissions           Json?
-  allowCustomInstructions     Boolean @default(false)
+  id                      Int     @id @default(autoincrement())
+  ticketType              String  @unique
+  permissions             Json?
+  allowCustomInstructions Boolean @default(false)
   useCustomInstructions   Boolean @default(false)
-  instructions          String?
-  previewTitle          String?
+  instructions            String?
+  previewTitle            String?
 }
 
 model TicketBlacklist {
-  id        Int      @id @default(autoincrement())
-  userId    String   @unique
+  id        Int       @id @default(autoincrement())
+  userId    String    @unique
   expiresAt DateTime?
-  createdAt DateTime @default(now())
+  createdAt DateTime  @default(now())
+
+  @@index([expiresAt])
 }

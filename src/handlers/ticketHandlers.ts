@@ -7,31 +7,41 @@ import {
   ButtonBuilder,
   ButtonStyle,
   TextChannel,
-  CommandInteraction,
-  Interaction,
-  TextInputBuilder,
-  ModalBuilder,
-  TextInputStyle,
   OverwriteResolvable,
   ButtonInteraction,
   PermissionsBitField,
-  OverwriteType,
-  GuildMember,
-  InteractionType,
-  ComponentType,
-  ButtonComponent,
   ThreadChannel,
   ChatInputCommandInteraction
 } from 'discord.js';
 import config from '../config/config.js';
 import prisma from '../utils/database.js';
 import { getCategoryId } from '../utils/discordUtils.js';
-import { exec } from 'child_process';
-import { promisify } from 'util';
-import fs from 'fs';
-import axios from 'axios';
+import { unlink } from 'node:fs/promises';
+import { reserveTicketNumber } from '../utils/ticketNumber.js';
+import { memberHasRole } from '../utils/memberRoles.js';
+import { exportTranscript } from '../utils/transcript.js';
+import { ACTIVE_TICKET_STATUSES } from '../utils/ticketPolicy.js';
 
-const execAsync = promisify(exec);
+type SerializableComponent = { toJSON(): unknown };
+
+function updateButtonStates(
+  rows: readonly SerializableComponent[],
+  disabledFor: (customId: string) => boolean | undefined,
+): any[] {
+  return rows.map(row => {
+    const json = structuredClone(row.toJSON()) as {
+      components?: Array<{ custom_id?: string; disabled?: boolean }>;
+    };
+    if (!Array.isArray(json.components)) return json;
+
+    for (const component of json.components) {
+      if (!component.custom_id) continue;
+      const disabled = disabledFor(component.custom_id);
+      if (disabled !== undefined) component.disabled = disabled;
+    }
+    return json;
+  });
+}
 
 export async function setupTicketSystem(client: Client): Promise<void> {
   try {
@@ -47,7 +57,7 @@ export async function setupTicketSystem(client: Client): Promise<void> {
       msg =>
         msg.author.id === client.user?.id &&
         msg.embeds.length > 0 &&
-        msg.embeds[0].title === 'Need Assistance?'
+        msg.embeds[0]?.title === 'Need Assistance?'
     );
 
     if (!setupMessageExists) {
@@ -89,10 +99,6 @@ export async function setupTicketSystem(client: Client): Promise<void> {
     console.error('Error in ticketing system setup:', error);
   }
 }
-export const special_roles = [
-  config.boosterRoleId,
-  config.staffRoleId
-];
 export async function createTicketChannel(interaction: any, ticketType: string, data: { title: string; description: string; banType?: string }, shouldDefer: boolean = true): Promise<TextChannel> {
   const { guild, user } = interaction
   if (!guild) {
@@ -104,12 +110,11 @@ export async function createTicketChannel(interaction: any, ticketType: string, 
   if (shouldDefer && !interaction.deferred) {
     await interaction.deferReply({ ephemeral: true })
   }
-  const settings = await prisma.ticketSettings.findUnique({ where: { id: 1 } })
-  let ticketCounter = settings?.ticketCounter || 1
+  const ticketCounter = await reserveTicketNumber()
   const prefix = '┃'
   const username = user.username.split(/[\s\W_]+/)[0] || user.username
   let ticketChannelName: string
-  if (interaction.member && (interaction.member as any).roles && (interaction.member as any).roles.cache.some((r: any) => special_roles.includes(r.id))) {
+  if (memberHasRole(interaction.member, config.boosterRoleId) || memberHasRole(interaction.member, config.staffRoleId)) {
     ticketChannelName = `💞︱priority・${username}`
   } else {
     ticketChannelName = `${ticketCounter}${prefix}${username}`
@@ -123,8 +128,8 @@ export async function createTicketChannel(interaction: any, ticketType: string, 
     }
   }
   const configEntry = await prisma.ticketConfig.findUnique({ where: { ticketType: effectiveTicketType } })
-  if (!configEntry || !Array.isArray(configEntry.permissions) || !configEntry.permissions.length) {
-    throw new Error(`No permissions found in DB for ticketType ${effectiveTicketType}`)
+  if (!configEntry || !Array.isArray(configEntry.permissions)) {
+    throw new Error(`No permission configuration found for ticket type ${effectiveTicketType}`)
   }
   const allowedRoleIds = configEntry.permissions as string[]
   let permissionOverwrites: OverwriteResolvable[] = [
@@ -153,6 +158,7 @@ export async function createTicketChannel(interaction: any, ticketType: string, 
     topic: `[${ticketType}] Ticket for ${user.username}`
   })
   const ticketChannel = channelCreated as TextChannel
+  try {
   const welcomeMessage = `Hey <@${user.id}> 👋!\n\`\`\`Please wait patiently for staff to reply. If no one responds, you may ping staff. Thanks!\`\`\``
   await ticketChannel.send(welcomeMessage)
   let embed = new EmbedBuilder().setColor(0x0099FF)
@@ -165,7 +171,6 @@ export async function createTicketChannel(interaction: any, ticketType: string, 
       const storeInstr = configEntry.useCustomInstructions && configEntry.instructions ? configEntry.instructions : 'No store instructions configured.'
       embed.setTitle('Store Purchase').setDescription(`\`\`\`${storeInstr}\`\`\``)
     } else if (ticketType === 'Alt Appeal') {
-      const altInstr = configEntry.useCustomInstructions && configEntry.instructions ? configEntry.instructions : 'No alt appeal instructions configured.'
       embed.setTitle(data.title).setDescription(`\`\`\`${data.description}\n\`\`\``)
     } else if (ticketType === 'Partnership') {
       embed.setTitle(data.title).setDescription(`\`\`\`${data.description}\`\`\``)
@@ -210,18 +215,21 @@ export async function createTicketChannel(interaction: any, ticketType: string, 
       reason: ticketType === 'Partnership' ? data.description : finalReason
     }
   })
-  await prisma.ticketSettings.update({
-    where: { id: 1 },
-    data: { ticketCounter: ticketCounter + 1 }
-  })
   if (shouldDefer) {
     await interaction.editReply({ content: `Your ticket has been opened. Head over to <#${ticketChannel.id}> to continue.` }).catch(() => {})
   }
   return ticketChannel
+  } catch (error) {
+    await ticketChannel.delete('Rolling back failed ticket creation.').catch(rollbackError => {
+      console.error(`Failed to clean up ticket channel ${ticketChannel.id}:`, rollbackError)
+    })
+    throw error
+  }
 }
 
 
 export async function handleCloseTicket(interaction: ButtonInteraction): Promise<void> {
+  let closedTicket: { id: number; previousStatus: string } | undefined;
   try {
     await interaction.deferReply({ ephemeral: true });
     const channel = interaction.channel;
@@ -234,22 +242,8 @@ export async function handleCloseTicket(interaction: ButtonInteraction): Promise
       await interaction.followUp({ content: 'Ticket not found in the database.', ephemeral: true });
       return;
     }
-    if (ticket.ticketMessageId) {
-      const originalMsg = await channel.messages.fetch(ticket.ticketMessageId).catch(() => null);
-      if (originalMsg) {
-        const disabledComponents = originalMsg.components.map(row => ({
-          type: row.type,
-          components: row.components.map(component => {
-            const data = JSON.parse(JSON.stringify(component));
-            data.disabled = true;
-            return data;
-          })
-        }));
-        await originalMsg.edit({ components: disabledComponents });
-      }
-    }
     const configEntry = await prisma.ticketConfig.findUnique({ where: { ticketType: ticket.ticketType } });
-    if (!configEntry || !Array.isArray(configEntry.permissions) || !configEntry.permissions.length) {
+    if (!configEntry || !Array.isArray(configEntry.permissions)) {
       await interaction.followUp({ content: 'No permission configuration found for this ticket type.', ephemeral: true });
       return;
     }
@@ -265,14 +259,30 @@ export async function handleCloseTicket(interaction: ButtonInteraction): Promise
         allow: [PermissionsBitField.Flags.ViewChannel, PermissionsBitField.Flags.SendMessages]
       }))
     ];
-    await channel.edit({ permissionOverwrites: newOverwrites });
     const archivedCategoryId = getCategoryId(ticket.ticketType, true);
     if (!archivedCategoryId) {
       await interaction.followUp({ content: 'Archived category not set for this ticket type.', ephemeral: true });
       return;
     }
+    const close = await prisma.ticket.updateMany({
+      where: { id: ticket.id, status: { in: [...ACTIVE_TICKET_STATUSES] } },
+      data: { status: 'closed' },
+    });
+    if (close.count === 0) {
+      await interaction.followUp({ content: 'This ticket has already been processed.', ephemeral: true });
+      return;
+    }
+    closedTicket = { id: ticket.id, previousStatus: ticket.status };
+
+    if (ticket.ticketMessageId) {
+      const originalMsg = await channel.messages.fetch(ticket.ticketMessageId).catch(() => null);
+      if (originalMsg) {
+        const disabledComponents = updateButtonStates(originalMsg.components, () => true);
+        await originalMsg.edit({ components: disabledComponents });
+      }
+    }
+    await channel.edit({ permissionOverwrites: newOverwrites });
     await channel.setParent(archivedCategoryId, { lockPermissions: false });
-    await prisma.ticket.update({ where: { id: ticket.id }, data: { status: 'closed' } });
     const closeEmbed = new EmbedBuilder()
       .setColor(0xffff00)
       .setDescription(`> 🔒 Ticket closed by <@${interaction.user.id}>`);
@@ -289,14 +299,21 @@ export async function handleCloseTicket(interaction: ButtonInteraction): Promise
         .setEmoji('🔓')
     );
     await channel.send({ embeds: [closeEmbed], components: [buttonRow] });
+    closedTicket = undefined;
     await interaction.followUp({ content: 'Ticket has been closed and archived.', ephemeral: true });
   } catch (error) {
     console.error('Error closing ticket:', error);
+    if (closedTicket) {
+      await prisma.ticket.updateMany({
+        where: { id: closedTicket.id, status: 'closed' },
+        data: { status: closedTicket.previousStatus },
+      }).catch(rollbackError => console.error('Failed to restore ticket status:', rollbackError));
+    }
     await interaction.followUp({ content: 'Failed to close ticket.', ephemeral: true });
   }
 }
 
-export async function handlePlayerInfo(interaction: any, client: Client): Promise<void> {
+export async function handlePlayerInfo(interaction: any): Promise<void> {
   const ticket = await prisma.ticket.findFirst({ where: { channelId: interaction.channel.id } });
   if (!ticket) {
     if (typeof interaction.reply === 'function') {
@@ -327,7 +344,7 @@ export async function handlePlayerInfo(interaction: any, client: Client): Promis
       : null;
 
   const embed = new EmbedBuilder().setColor(0x0099FF).setDescription(
-    `# [🎯 Player Information | ${profile.ign}](https://stats.pika-network.net/player/${profile.ign})\n` +
+    `# [🎯 Player Information | ${profile.ign}](https://stats.pika-network.net/player/${encodeURIComponent(profile.ign)})\n` +
       (lastSeenTs
         ? `- <a:last_seen:1347936608254427229> **Last Seen:** <t:${lastSeenTs}:R>\n`
         : '') +
@@ -341,7 +358,9 @@ export async function handlePlayerInfo(interaction: any, client: Client): Promis
       `- **Clan Name:** ${profile.clanName || 'N/A'}`
   );
 
-  let friends: string[] = (profile.friends as string[]) || [];
+  const friends = Array.isArray(profile.friends)
+    ? profile.friends.filter((friend): friend is string => typeof friend === 'string').slice(0, 40)
+    : [];
   if (friends.length > 5) {
     const mid = Math.ceil(friends.length / 2);
     const friendList1 = friends
@@ -367,10 +386,13 @@ export async function handlePlayerInfo(interaction: any, client: Client): Promis
     embed.addFields({ name: 'Friend List', value: 'None', inline: false });
   }
 
-  let headURL = `https://mc-heads.net/avatar/${profile.ign}/overlay`;
+  let headURL = `https://mc-heads.net/avatar/${encodeURIComponent(profile.ign)}/overlay`;
   try {
-    const res = await axios.head(headURL);
-    if (res.status !== 200) {
+    const response = await fetch(headURL, {
+      method: 'HEAD',
+      signal: AbortSignal.timeout(5_000),
+    });
+    if (!response.ok) {
       headURL = `https://mc-heads.net/avatar/dewier/overlay`;
     }
   } catch {
@@ -386,9 +408,8 @@ export async function handlePlayerInfo(interaction: any, client: Client): Promis
   }
 }
 
-export async function handleAddCommand(interaction: CommandInteraction): Promise<void> {
-  const member = interaction.member as GuildMember;
-  if (!member || !member.roles.cache.has(config.staffRoleId)) {
+export async function handleAddCommand(interaction: ChatInputCommandInteraction): Promise<void> {
+  if (!memberHasRole(interaction.member, config.staffRoleId)) {
     await interaction.reply({
       content: 'You are not authorized to add users or roles.',
       ephemeral: true
@@ -396,7 +417,9 @@ export async function handleAddCommand(interaction: CommandInteraction): Promise
     return;
   }
   await interaction.deferReply({ ephemeral: false });
-  const mentionable = (interaction.options as any).getMentionable('mentionable');
+  const option = interaction.options.get('mentionable', true);
+  const mentionable = option.user ?? option.role;
+  const isUser = Boolean(option.user);
   const channel = interaction.channel;
   if (!channel) {
     await interaction.editReply({ content: 'Channel not found.' });
@@ -409,7 +432,7 @@ export async function handleAddCommand(interaction: CommandInteraction): Promise
 
   if ('isThread' in channel && channel.isThread()) {
     const thread = channel as ThreadChannel;
-    if ((mentionable as any).user) {
+    if (isUser) {
       await thread.members.add(mentionable.id);
     } else {
       const parent = thread.parent;
@@ -434,7 +457,7 @@ export async function handleAddCommand(interaction: CommandInteraction): Promise
 
   const ticket = await prisma.ticket.findFirst({ where: { channelId: channel.id } });
   if (ticket) {
-    if ((mentionable as any).user) {
+    if (isUser) {
       let currentUsers: string[] = Array.isArray(ticket.added_user)
         ? (ticket.added_user as string[])
         : [];
@@ -459,7 +482,7 @@ export async function handleAddCommand(interaction: CommandInteraction): Promise
     }
   }
 
-  const ping = (mentionable as any).user
+  const ping = isUser
     ? `<@${mentionable.id}>`
     : `<@&${mentionable.id}>`;
 
@@ -469,9 +492,8 @@ export async function handleAddCommand(interaction: CommandInteraction): Promise
   await interaction.editReply({ content: ping, embeds: [embed] });
 }
 
-export async function handleRemoveCommand(interaction: CommandInteraction): Promise<void> {
-  const member = interaction.member as GuildMember;
-  if (!member || !member.roles.cache.has(config.staffRoleId)) {
+export async function handleRemoveCommand(interaction: ChatInputCommandInteraction): Promise<void> {
+  if (!memberHasRole(interaction.member, config.staffRoleId)) {
     await interaction.reply({
       content: 'You are not authorized to remove users or roles.',
       ephemeral: true
@@ -480,7 +502,9 @@ export async function handleRemoveCommand(interaction: CommandInteraction): Prom
   }
 
   await interaction.deferReply({ ephemeral: false });
-  const mentionable = (interaction.options as any).getMentionable('mentionable');
+  const option = interaction.options.get('mentionable', true);
+  const mentionable = option.user ?? option.role;
+  const isUser = Boolean(option.user);
   const channel = interaction.channel;
   if (!channel) {
     await interaction.editReply({ content: 'Channel not found.' });
@@ -493,7 +517,7 @@ export async function handleRemoveCommand(interaction: CommandInteraction): Prom
 
   if ('isThread' in channel && channel.isThread()) {
     const thread = channel as ThreadChannel;
-    if ((mentionable as any).user) {
+    if (isUser) {
       await thread.members.remove(mentionable.id);
     } else {
       const parent = thread.parent;
@@ -512,7 +536,7 @@ export async function handleRemoveCommand(interaction: CommandInteraction): Prom
   // Update ticket record.
   const ticket = await prisma.ticket.findFirst({ where: { channelId: channel.id } });
   if (ticket) {
-    if ((mentionable as any).user) {
+    if (isUser) {
       let currentUsers: string[] = Array.isArray(ticket.added_user)
         ? (ticket.added_user as string[])
         : [];
@@ -532,7 +556,7 @@ export async function handleRemoveCommand(interaction: CommandInteraction): Prom
       });
     }
   }
-  const ping = (mentionable as any).user
+  const ping = isUser
     ? `<@${mentionable.id}>`
     : `<@&${mentionable.id}>`;
 
@@ -544,22 +568,11 @@ export async function handleRemoveCommand(interaction: CommandInteraction): Prom
 
 
 
-export async function promptReason(client: Client, interaction: Interaction, action: string): Promise<void> {
-  const modal = new ModalBuilder().setCustomId(`reason_${action}`).setTitle('Reason for Action');
-  const reasonInput = new TextInputBuilder()
-    .setCustomId('reason')
-    .setLabel('Please provide a reason:')
-    .setStyle(TextInputStyle.Paragraph)
-    .setRequired(true);
-
-  modal.addComponents(new ActionRowBuilder<TextInputBuilder>().addComponents(reasonInput));
-  await (interaction as any).showModal(modal);
-}
-
-export async function handleClaimTicket(interaction: ModalSubmitInteraction, reason: string, client: Client): Promise<void> {
+export async function handleClaimTicket(interaction: ModalSubmitInteraction, reason: string): Promise<void> {
+  let transcriptFile: string | undefined;
+  let claimedTicket: { id: number; previousStatus: string } | undefined;
   try {
-    const member = interaction.member as GuildMember;
-    if (!member || !member.roles.cache.has(config.staffRoleId)) {
+    if (!memberHasRole(interaction.member, config.staffRoleId)) {
       await interaction.reply({ content: 'You are not authorized to claim tickets.', ephemeral: true });
       return;
     }
@@ -570,36 +583,29 @@ export async function handleClaimTicket(interaction: ModalSubmitInteraction, rea
       await interaction.deleteReply();
       return;
     }
-    await prisma.ticket.update({ where: { id: ticket.id }, data: { status: 'claimed' } });
-    
     if (!interaction.channel || !(interaction.channel instanceof TextChannel)) {
-      await interaction.deleteReply();
+      await interaction.editReply({ content: 'This action is only available in channel-based tickets.' });
       return;
     }
+    const claim = await prisma.ticket.updateMany({
+      where: { id: ticket.id, status: { in: [...ACTIVE_TICKET_STATUSES] } },
+      data: { status: 'claimed' },
+    });
+    if (claim.count === 0) {
+      await interaction.editReply({ content: 'This ticket has already been processed.' });
+      return;
+    }
+    claimedTicket = { id: ticket.id, previousStatus: ticket.status };
+
     const ticketChannel = interaction.channel as TextChannel;
     const ticketCreator = await interaction.guild?.members.fetch(ticket.userId).catch(() => null);
     const nowTs = Math.floor(Date.now() / 1000);
     
-    const messages = await ticketChannel.messages.fetch({ limit: 100 });
-    const sortedMessages = Array.from(messages.values()).sort((a, b) => a.createdTimestamp - b.createdTimestamp);
-    const firstMsgId = sortedMessages[0]?.id;
-    const lastMsgId = sortedMessages[sortedMessages.length - 1]?.id;
-    if (!firstMsgId || !lastMsgId) {
-      await interaction.deleteReply();
-      return;
-    }
-    
-    const transcriptFile = `transcripts/transcript_${ticketChannel.id}.html`;
-    const pythonCmd = `python3 src/transcripts/script.py --token "${config.token}" --channel_id ${ticketChannel.id} --start ${firstMsgId} --end ${lastMsgId} --output_file "${transcriptFile}"`;
-    const { stderr } = await execAsync(pythonCmd);
-    if (stderr) console.error(stderr);
+    transcriptFile = await exportTranscript(ticketChannel);
     
     const logChannelId = (ticket.ticketType === 'General') ? config.transcriptChannel1 : config.transcriptChannel2;
-    const logChannel = await interaction.guild?.channels.fetch(logChannelId) as TextChannel;
-    if (!logChannel) {
-      await interaction.deleteReply();
-      return;
-    }
+    const logChannel = await interaction.guild?.channels.fetch(logChannelId);
+    if (!(logChannel instanceof TextChannel)) throw new Error('Transcript log channel is unavailable.');
     
     const transcriptAttachment = { attachment: transcriptFile, name: `transcript_${ticketChannel.id}.html` };
     const logEmbed = new EmbedBuilder()
@@ -639,20 +645,30 @@ export async function handleClaimTicket(interaction: ModalSubmitInteraction, rea
       }
     }
     
-    fs.unlink(transcriptFile, (err) => { if (err) console.error('Error deleting transcript file:', err); });
-    
     await interaction.deleteReply();
     await ticketChannel.delete();
+    claimedTicket = undefined;
     
   } catch (error) {
     console.error('Error in handleClaimTicket:', error);
+    if (claimedTicket) {
+      await prisma.ticket.updateMany({
+        where: { id: claimedTicket.id, status: 'claimed' },
+        data: { status: claimedTicket.previousStatus },
+      }).catch(rollbackError => console.error('Failed to restore ticket status:', rollbackError));
+    }
     try {
-      await interaction.deleteReply();
-    } catch (e) { /* ignore cleanup errors */ }
+      await interaction.editReply({ content: 'Failed to claim the ticket. Please try again.' });
+    } catch { /* ignore cleanup errors */ }
+  } finally {
+    if (transcriptFile) {
+      await unlink(transcriptFile).catch(error => console.error('Error deleting transcript file:', error));
+    }
   }
 }
 
 export async function handleReopenTicket(interaction: ButtonInteraction): Promise<void> {
+  let reopenedTicketId: number | undefined;
   try {
     await interaction.deferReply({ ephemeral: true });
     const channel = interaction.channel;
@@ -670,62 +686,38 @@ export async function handleReopenTicket(interaction: ButtonInteraction): Promis
       await interaction.followUp({ content: 'Normal category not set for this ticket type.', ephemeral: true });
       return;
     }
+    const reopen = await prisma.ticket.updateMany({
+      where: { id: ticket.id, status: 'closed' },
+      data: { status: 'reopened', lastMessageAt: new Date() },
+    });
+    if (reopen.count === 0) {
+      await interaction.followUp({ content: 'This ticket is not closed or has already been reopened.', ephemeral: true });
+      return;
+    }
+    reopenedTicketId = ticket.id;
+
     await channel.setParent(normalCategoryId, { lockPermissions: false });
     await channel.permissionOverwrites.edit(ticket.userId, {
       ViewChannel: true,
       SendMessages: true
     });
-    await prisma.ticket.update({
-      where: { id: ticket.id },
-      data: {
-        status: 'reopened',
-        lastMessageAt: new Date() // reset inactivity timer on reopen
-      }
-    });
-    
     if (ticket.ticketMessageId) {
       const storedMessage = await channel.messages.fetch(ticket.ticketMessageId).catch(() => null);
       if (storedMessage) {
-        const updatedRows = storedMessage.components.map(row => {
-          const newRow = new ActionRowBuilder<ButtonBuilder>();
-          row.components.forEach(comp => {
-            if (comp.type === ComponentType.Button) {
-              const button = ButtonBuilder.from(comp);
-              const customId = (button.data as any).custom_id;
-              console.log('Stored message button custom_id:', customId);
-              if (customId === 'close_ticket' || customId === 'claim_ticket') {
-                button.setDisabled(false);
-              }
-              newRow.addComponents(button);
-            }
-          });
-          return newRow;
-        });
+        const updatedRows = updateButtonStates(storedMessage.components, customId =>
+          customId === 'close_ticket' || customId === 'claim_ticket' ? false : undefined
+        );
         await storedMessage.edit({ components: updatedRows });
       }
     }
     
     // -------------------------------
     if (interaction.message) {
-      const updatedRows = interaction.message.components.map(row => {
-        const newRow = new ActionRowBuilder<ButtonBuilder>();
-        row.components.forEach(comp => {
-          if (comp.type === ComponentType.Button) {
-            const button = ButtonBuilder.from(comp);
-            const customId = (button.data as any).custom_id;
-            console.log('Interaction message button custom_id:', customId);
-            if (
-              customId === 'reopen_ticket' ||
-              customId === 'delete_ticket_manual' ||
-              customId === 'delete_ticket_auto'
-            ) {
-              button.setDisabled(true);
-            }
-            newRow.addComponents(button);
-          }
-        });
-        return newRow;
-      });
+      const updatedRows = updateButtonStates(interaction.message.components, customId =>
+        ['reopen_ticket', 'delete_ticket_manual', 'delete_ticket_auto'].includes(customId)
+          ? true
+          : undefined
+      );
       await interaction.message.edit({ components: updatedRows });
     }
     await channel.send({
@@ -736,17 +728,24 @@ export async function handleReopenTicket(interaction: ButtonInteraction): Promis
           .setDescription(`> Ticket was reopened by <@${interaction.user.id}>`)
       ]
     });
-    
+    reopenedTicketId = undefined;
     await interaction.followUp({ content: 'Ticket has been reopened.', ephemeral: true });
   } catch (error) {
     console.error('Error in handleReopenTicket:', error);
+    if (reopenedTicketId !== undefined) {
+      await prisma.ticket.updateMany({
+        where: { id: reopenedTicketId, status: 'reopened' },
+        data: { status: 'closed' },
+      }).catch(rollbackError => console.error('Failed to restore ticket status:', rollbackError));
+    }
     await interaction.followUp({ content: 'Failed to reopen ticket.', ephemeral: true });
   }
 }
-export async function handleDeleteTicketManual(interaction: ModalSubmitInteraction, reason: string, client: Client): Promise<void> {
+export async function handleDeleteTicketManual(interaction: ModalSubmitInteraction, reason: string): Promise<void> {
+  let transcriptFile: string | undefined;
+  let deletedTicket: { id: number; previousStatus: string } | undefined;
   try {
-    const member = interaction.member as GuildMember;
-    if (!member || !member.roles.cache.has(config.staffRoleId)) {
+    if (!memberHasRole(interaction.member, config.staffRoleId)) {
       await interaction.reply({ content: 'You are not authorized to delete tickets.', ephemeral: true });
       return;
     }
@@ -754,34 +753,32 @@ export async function handleDeleteTicketManual(interaction: ModalSubmitInteracti
     
     const ticket = await prisma.ticket.findFirst({ where: { channelId: interaction.channel?.id } });
     if (!ticket) {
-      await interaction.deleteReply();
+      await interaction.editReply({ content: 'Ticket not found in the database.' });
       return;
     }
-    
-    const ticketChannel = interaction.channel as TextChannel;
+    if (!(interaction.channel instanceof TextChannel)) {
+      await interaction.editReply({ content: 'This action is only available in channel-based tickets.' });
+      return;
+    }
+    const deletion = await prisma.ticket.updateMany({
+      where: { id: ticket.id, status: 'closed' },
+      data: { status: 'deleted' },
+    });
+    if (deletion.count === 0) {
+      await interaction.editReply({ content: 'This ticket is no longer available for deletion.' });
+      return;
+    }
+    deletedTicket = { id: ticket.id, previousStatus: ticket.status };
+
+    const ticketChannel = interaction.channel;
     const ticketCreator = await interaction.guild?.members.fetch(ticket.userId).catch(() => null);
     const nowTs = Math.floor(Date.now() / 1000);
     
-    const messages = await ticketChannel.messages.fetch({ limit: 100 });
-    const sortedMessages = Array.from(messages.values()).sort((a, b) => a.createdTimestamp - b.createdTimestamp);
-    const firstMsgId = sortedMessages[0]?.id;
-    const lastMsgId = sortedMessages[sortedMessages.length - 1]?.id;
-    if (!firstMsgId || !lastMsgId) {
-      await interaction.deleteReply();
-      return;
-    }
-    
-    const transcriptFile = `transcripts/transcript_${ticketChannel.id}.html`;
-    const pythonCmd = `python3 src/transcripts/script.py --token "${config.token}" --channel_id ${ticketChannel.id} --start ${firstMsgId} --end ${lastMsgId} --output_file "${transcriptFile}"`;
-    const { stderr } = await execAsync(pythonCmd);
-    if (stderr) console.error(stderr);
+    transcriptFile = await exportTranscript(ticketChannel);
     
     const logChannelId = (ticket.ticketType === 'General') ? config.transcriptChannel1 : config.transcriptChannel2;
-    const logChannel = await interaction.guild?.channels.fetch(logChannelId) as TextChannel;
-    if (!logChannel) {
-      await interaction.deleteReply();
-      return;
-    }
+    const logChannel = await interaction.guild?.channels.fetch(logChannelId);
+    if (!(logChannel instanceof TextChannel)) throw new Error('Transcript log channel is unavailable.');
     
     const transcriptAttachment = { attachment: transcriptFile, name: `transcript_${ticketChannel.id}.html` };
     const logEmbed = new EmbedBuilder()
@@ -820,53 +817,67 @@ export async function handleDeleteTicketManual(interaction: ModalSubmitInteracti
       }
     }
     
-    fs.unlink(transcriptFile, (err) => { if (err) console.error('Error deleting transcript file:', err); });
     await interaction.deleteReply();
     await ticketChannel.delete();
+    deletedTicket = undefined;
     
   } catch (error) {
     console.error('Error in handleDeleteTicketManual:', error);
+    if (deletedTicket) {
+      await prisma.ticket.updateMany({
+        where: { id: deletedTicket.id, status: 'deleted' },
+        data: { status: deletedTicket.previousStatus },
+      }).catch(rollbackError => console.error('Failed to restore ticket status:', rollbackError));
+    }
     try {
-      await interaction.deleteReply();
-    } catch (e) { /* ignore cleanup errors */ }
+      await interaction.editReply({ content: 'Failed to delete the ticket. Please try again.' });
+    } catch { /* ignore cleanup errors */ }
+  } finally {
+    if (transcriptFile) {
+      await unlink(transcriptFile).catch(error => console.error('Error deleting transcript file:', error));
+    }
   }
 }
 
 
 export async function handleDeleteTicketAuto(interaction: ButtonInteraction): Promise<void> {
+  let transcriptFile: string | undefined;
+  let deletedTicket: { id: number; previousStatus: string } | undefined;
   try {
+    if (!memberHasRole(interaction.member, config.staffRoleId)) {
+      await interaction.reply({ content: 'You are not authorized to delete tickets.', ephemeral: true });
+      return;
+    }
     await interaction.deferReply({ ephemeral: true });
     
     const ticket = await prisma.ticket.findFirst({ where: { channelId: interaction.channel?.id } });
     if (!ticket) {
-      await interaction.deleteReply();
+      await interaction.editReply({ content: 'Ticket not found in the database.' });
       return;
     }
-    
-    const ticketChannel = interaction.channel as TextChannel;
+    if (!(interaction.channel instanceof TextChannel)) {
+      await interaction.editReply({ content: 'This action is only available in channel-based tickets.' });
+      return;
+    }
+    const deletion = await prisma.ticket.updateMany({
+      where: { id: ticket.id, status: 'closed' },
+      data: { status: 'deleted' },
+    });
+    if (deletion.count === 0) {
+      await interaction.editReply({ content: 'This ticket is no longer available for deletion.' });
+      return;
+    }
+    deletedTicket = { id: ticket.id, previousStatus: ticket.status };
+
+    const ticketChannel = interaction.channel;
     const ticketCreator = await interaction.guild?.members.fetch(ticket.userId).catch(() => null);
     const nowTs = Math.floor(Date.now() / 1000);
     
-    const messages = await ticketChannel.messages.fetch({ limit: 100 });
-    const sortedMessages = Array.from(messages.values()).sort((a, b) => a.createdTimestamp - b.createdTimestamp);
-    const firstMsgId = sortedMessages[0]?.id;
-    const lastMsgId = sortedMessages[sortedMessages.length - 1]?.id;
-    if (!firstMsgId || !lastMsgId) {
-      await interaction.deleteReply();
-      return;
-    }
-    
-    const transcriptFile = `transcripts/transcript_${ticketChannel.id}.html`;
-    const pythonCmd = `python3 src/transcripts/script.py --token "${config.token}" --channel_id ${ticketChannel.id} --start ${firstMsgId} --end ${lastMsgId} --output_file "${transcriptFile}"`;
-    const { stderr } = await execAsync(pythonCmd);
-    if (stderr) console.error(stderr);
+    transcriptFile = await exportTranscript(ticketChannel);
     
     const logChannelId = (ticket.ticketType === 'General') ? config.transcriptChannel1 : config.transcriptChannel2;
-    const logChannel = await interaction.guild?.channels.fetch(logChannelId) as TextChannel;
-    if (!logChannel) {
-      await interaction.deleteReply();
-      return;
-    }
+    const logChannel = await interaction.guild?.channels.fetch(logChannelId);
+    if (!(logChannel instanceof TextChannel)) throw new Error('Transcript log channel is unavailable.');
     
     const transcriptAttachment = { attachment: transcriptFile, name: `transcript_${ticketChannel.id}.html` };
     
@@ -910,15 +921,25 @@ export async function handleDeleteTicketAuto(interaction: ButtonInteraction): Pr
       }
     }
     
-    fs.unlink(transcriptFile, (err) => { if (err) console.error('Error deleting transcript file:', err); });
     await interaction.deleteReply();
     await ticketChannel.delete();
+    deletedTicket = undefined;
     
   } catch (error) { 
     console.error('Error in handleDeleteTicketAuto:', error);
+    if (deletedTicket) {
+      await prisma.ticket.updateMany({
+        where: { id: deletedTicket.id, status: 'deleted' },
+        data: { status: deletedTicket.previousStatus },
+      }).catch(rollbackError => console.error('Failed to restore ticket status:', rollbackError));
+    }
     try {
-      await interaction.deleteReply();
-    } catch (e) { /* ignore cleanup errors */ }
+      await interaction.editReply({ content: 'Failed to delete the ticket. Please try again.' });
+    } catch { /* ignore cleanup errors */ }
+  } finally {
+    if (transcriptFile) {
+      await unlink(transcriptFile).catch(error => console.error('Error deleting transcript file:', error));
+    }
   }
 }
 export async function handleAdvancedTicketLog(interaction: ButtonInteraction): Promise<void> {
@@ -929,7 +950,7 @@ export async function handleAdvancedTicketLog(interaction: ButtonInteraction): P
     const customId = interaction.customId; // e.g. "advanced_ticketLog_123"
     const parts = customId.split('_');
     const ticketIdStr = parts[parts.length - 1];
-    const ticketId = parseInt(ticketIdStr);
+    const ticketId = Number.parseInt(ticketIdStr ?? '', 10);
     if (isNaN(ticketId)) {
       await interaction.editReply({ content: 'Invalid ticket ID.' });
       return;
@@ -987,10 +1008,11 @@ export async function handleAdvancedTicketLog(interaction: ButtonInteraction): P
     await interaction.editReply({ content: 'Failed to display advanced ticket information.' });
   }
 }
-export async function handleClaimCommand(interaction: ChatInputCommandInteraction, reason: string, client: any): Promise<void> {
+export async function handleClaimCommand(interaction: ChatInputCommandInteraction, reason: string): Promise<void> {
+  let transcriptFile: string | undefined;
+  let claimedTicket: { id: number; previousStatus: string } | undefined;
   try {
-    const member = interaction.member as GuildMember;
-    if (!member || !member.roles.cache.has(config.staffRoleId)) {
+    if (!memberHasRole(interaction.member, config.staffRoleId)) {
       await interaction.reply({ content: 'You are not authorized to claim tickets.', ephemeral: true });
       return;
     }
@@ -1001,35 +1023,28 @@ export async function handleClaimCommand(interaction: ChatInputCommandInteractio
       await interaction.deleteReply();
       return;
     }
-    await prisma.ticket.update({ where: { id: ticket.id }, data: { status: 'claimed' } });
-    
     if (!interaction.channel || !(interaction.channel instanceof TextChannel)) {
-      await interaction.deleteReply();
+      await interaction.editReply({ content: 'This action is only available in channel-based tickets.' });
       return;
     }
+    const claim = await prisma.ticket.updateMany({
+      where: { id: ticket.id, status: { in: [...ACTIVE_TICKET_STATUSES] } },
+      data: { status: 'claimed' },
+    });
+    if (claim.count === 0) {
+      await interaction.editReply({ content: 'This ticket has already been processed.' });
+      return;
+    }
+    claimedTicket = { id: ticket.id, previousStatus: ticket.status };
+
     const ticketChannel = interaction.channel as TextChannel;
     const ticketCreator = await interaction.guild?.members.fetch(ticket.userId).catch(() => null);
     const nowTs = Math.floor(Date.now() / 1000);
-    const messages = await ticketChannel.messages.fetch({ limit: 100 });
-    const sortedMessages = Array.from(messages.values()).sort((a, b) => a.createdTimestamp - b.createdTimestamp);
-    const firstMsgId = sortedMessages[0]?.id;
-    const lastMsgId = sortedMessages[sortedMessages.length - 1]?.id;
-    if (!firstMsgId || !lastMsgId) {
-      await interaction.deleteReply();
-      return;
-    }
-    
-    const transcriptFile = `transcripts/transcript_${ticketChannel.id}.html`;
-    const pythonCmd = `python3 src/transcripts/script.py --token "${config.token}" --channel_id ${ticketChannel.id} --start ${firstMsgId} --end ${lastMsgId} --output_file "${transcriptFile}"`;
-    const { stderr } = await execAsync(pythonCmd);
-    if (stderr) console.error(stderr);
+    transcriptFile = await exportTranscript(ticketChannel);
     
     const logChannelId = (ticket.ticketType === 'General') ? config.transcriptChannel1 : config.transcriptChannel2;
-    const logChannel = await interaction.guild?.channels.fetch(logChannelId) as TextChannel;
-    if (!logChannel) {
-      await interaction.deleteReply();
-      return;
-    }
+    const logChannel = await interaction.guild?.channels.fetch(logChannelId);
+    if (!(logChannel instanceof TextChannel)) throw new Error('Transcript log channel is unavailable.');
     
     const transcriptAttachment = { attachment: transcriptFile, name: `transcript_${ticketChannel.id}.html` };
     const logEmbed = new EmbedBuilder()
@@ -1070,21 +1085,31 @@ export async function handleClaimCommand(interaction: ChatInputCommandInteractio
       }
     }
     
-    fs.unlink(transcriptFile, (err) => { if (err) console.error('Error deleting transcript file:', err); });
-    
     await interaction.deleteReply();
     await ticketChannel.delete();
+    claimedTicket = undefined;
     
   } catch (error) {
     console.error('Error in handleClaimCommand:', error);
+    if (claimedTicket) {
+      await prisma.ticket.updateMany({
+        where: { id: claimedTicket.id, status: 'claimed' },
+        data: { status: claimedTicket.previousStatus },
+      }).catch(rollbackError => console.error('Failed to restore ticket status:', rollbackError));
+    }
     try {
-      await interaction.deleteReply();
-    } catch (e) { /* ignore cleanup errors */ }
+      await interaction.editReply({ content: 'Failed to claim the ticket. Please try again.' });
+    } catch { /* ignore cleanup errors */ }
+  } finally {
+    if (transcriptFile) {
+      await unlink(transcriptFile).catch(error => console.error('Error deleting transcript file:', error));
+    }
   }
 }
 
 
 export async function handleCloseCommand(interaction: ChatInputCommandInteraction): Promise<void> {
+  let closedTicket: { id: number; previousStatus: string } | undefined;
   try {
     await interaction.deferReply({ ephemeral: true });
     const channel = interaction.channel;
@@ -1099,22 +1124,8 @@ export async function handleCloseCommand(interaction: ChatInputCommandInteractio
       await interaction.followUp({ content: 'Ticket not found in the database.', ephemeral: true });
       return;
     }
-    if (ticket.ticketMessageId) {
-      const originalMsg = await channel.messages.fetch(ticket.ticketMessageId).catch(() => null);
-      if (originalMsg) {
-        const disabledComponents = originalMsg.components.map(row => ({
-          type: row.type,
-          components: row.components.map(component => {
-            const data = JSON.parse(JSON.stringify(component));
-            data.disabled = true;
-            return data;
-          })
-        }));
-        await originalMsg.edit({ components: disabledComponents });
-      }
-    }
     const configEntry = await prisma.ticketConfig.findUnique({ where: { ticketType: ticket.ticketType } });
-    if (!configEntry || !Array.isArray(configEntry.permissions) || !configEntry.permissions.length) {
+    if (!configEntry || !Array.isArray(configEntry.permissions)) {
       await interaction.followUp({ content: 'No permission configuration found for this ticket type.', ephemeral: true });
       return;
     }
@@ -1130,15 +1141,30 @@ export async function handleCloseCommand(interaction: ChatInputCommandInteractio
         allow: [PermissionsBitField.Flags.ViewChannel, PermissionsBitField.Flags.SendMessages]
       }))
     ];
-    await channel.edit({ permissionOverwrites: newOverwrites });
-    
     const archivedCategoryId = getCategoryId(ticket.ticketType, true);
     if (!archivedCategoryId) {
       await interaction.followUp({ content: 'Archived category not set for this ticket type.', ephemeral: true });
       return;
     }
+    const close = await prisma.ticket.updateMany({
+      where: { id: ticket.id, status: { in: [...ACTIVE_TICKET_STATUSES] } },
+      data: { status: 'closed' },
+    });
+    if (close.count === 0) {
+      await interaction.followUp({ content: 'This ticket has already been processed.', ephemeral: true });
+      return;
+    }
+    closedTicket = { id: ticket.id, previousStatus: ticket.status };
+
+    if (ticket.ticketMessageId) {
+      const originalMsg = await channel.messages.fetch(ticket.ticketMessageId).catch(() => null);
+      if (originalMsg) {
+        const disabledComponents = updateButtonStates(originalMsg.components, () => true);
+        await originalMsg.edit({ components: disabledComponents });
+      }
+    }
+    await channel.edit({ permissionOverwrites: newOverwrites });
     await channel.setParent(archivedCategoryId, { lockPermissions: false });
-    await prisma.ticket.update({ where: { id: ticket.id }, data: { status: 'closed' } });
     const closeEmbed = new EmbedBuilder()
       .setColor(0xffff00)
       .setDescription(`> 🔒 Ticket closed by <@${interaction.user.id}>`);
@@ -1155,9 +1181,16 @@ export async function handleCloseCommand(interaction: ChatInputCommandInteractio
         .setEmoji('🔓')
     );
     await channel.send({ embeds: [closeEmbed], components: [buttonRow] });
+    closedTicket = undefined;
     await interaction.followUp({ content: 'Ticket has been closed and archived.', ephemeral: true });
   } catch (error) {
     console.error('Error closing ticket:', error);
+    if (closedTicket) {
+      await prisma.ticket.updateMany({
+        where: { id: closedTicket.id, status: 'closed' },
+        data: { status: closedTicket.previousStatus },
+      }).catch(rollbackError => console.error('Failed to restore ticket status:', rollbackError));
+    }
     await interaction.followUp({ content: 'Failed to close ticket.', ephemeral: true });
   }
 }

@@ -1,6 +1,6 @@
 import { ModalBuilder, TextInputBuilder, ActionRowBuilder, TextInputStyle, ModalSubmitInteraction } from 'discord.js';
 
-export function showUniversalTicketModal(interaction: any, ticketType: string) {
+export async function showUniversalTicketModal(interaction: { showModal(modal: ModalBuilder): Promise<unknown> }, ticketType: string): Promise<void> {
   const modal = new ModalBuilder()
     .setCustomId(`universal_ticket_modal_${ticketType.toLowerCase()}`)
     .setTitle(`${ticketType} Ticket`);
@@ -8,17 +8,19 @@ export function showUniversalTicketModal(interaction: any, ticketType: string) {
     .setCustomId('title')
     .setLabel('Ticket Title')
     .setStyle(TextInputStyle.Short)
+    .setMaxLength(100)
     .setRequired(true);
   const descInput = new TextInputBuilder()
     .setCustomId('description')
     .setLabel('Describe your issue')
     .setStyle(TextInputStyle.Paragraph)
+    .setMaxLength(3_500)
     .setRequired(true);
   modal.addComponents(
     new ActionRowBuilder<TextInputBuilder>().addComponents(titleInput),
     new ActionRowBuilder<TextInputBuilder>().addComponents(descInput)
   );
-  interaction.showModal(modal);
+  await interaction.showModal(modal);
 }
 
 export function handleUniversalTicketModal(interaction: ModalSubmitInteraction) {

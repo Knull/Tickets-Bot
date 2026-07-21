@@ -1,14 +1,15 @@
 import cron from 'node-cron';
+import type { ScheduledTask } from 'node-cron';
 import prisma from '../utils/database.js';
 
-export function startBlacklistManager() {
-  cron.schedule('*/30 * * * * *', async () => {
-    const now = new Date();
-    const expired = await prisma.ticketBlacklist.findMany({
-      where: { expiresAt: { not: null, lt: now } }
-    });
-    for (const entry of expired) {
-      await prisma.ticketBlacklist.delete({ where: { id: entry.id } });
+export function startBlacklistManager(): ScheduledTask {
+  return cron.schedule('*/5 * * * *', async () => {
+    try {
+      await prisma.ticketBlacklist.deleteMany({
+        where: { expiresAt: { not: null, lte: new Date() } },
+      });
+    } catch (error) {
+      console.error('Blacklist expiry sweep failed:', error);
     }
-  });
+  }, { name: 'blacklist-expiry', noOverlap: true });
 }

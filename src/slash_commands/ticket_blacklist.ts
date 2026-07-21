@@ -1,27 +1,8 @@
 import { SlashCommandBuilder, ChatInputCommandInteraction, EmbedBuilder } from 'discord.js';
 import prisma from '../utils/database.js';
 import config from '../config/config.js';
-
-function parseDuration(str: string): number | null {
-  const match = str.match(/^(\d+)([smhdw])$/);
-  if (!match) return null;
-  const value = parseInt(match[1], 10);
-  const unit = match[2];
-  switch (unit) {
-    case 's':
-      return value * 1000;
-    case 'm':
-      return value * 60 * 1000;
-    case 'h':
-      return value * 60 * 60 * 1000;
-    case 'd':
-      return value * 24 * 60 * 60 * 1000;
-    case 'w':
-      return value * 7 * 24 * 60 * 60 * 1000;
-    default:
-      return null;
-  }
-}
+import { parseDuration } from '../utils/ticketPolicy.js';
+import { memberHasRole } from '../utils/memberRoles.js';
 
 const data = new SlashCommandBuilder()
   .setName('ticket_blacklist')
@@ -34,17 +15,7 @@ const data = new SlashCommandBuilder()
   );
 
 async function execute(interaction: ChatInputCommandInteraction) {
-  const member = interaction.member;
-  if (!member) {
-    await interaction.reply({ content: `Only <@&${config.adminRoleId}> can use this command.`, ephemeral: true });
-    return;
-  }
-  const roles = (member as any).roles;
-  if (!('cache' in roles)) {
-    await interaction.reply({ content: `Only <@&${config.adminRoleId}> can use this command.`, ephemeral: true });
-    return;
-  }
-  if (!roles.cache.has(config.adminRoleId)) {
+  if (!memberHasRole(interaction.member, config.adminRoleId)) {
     await interaction.reply({ content: `Only <@&${config.adminRoleId}> can use this command.`, ephemeral: true });
     return;
   }
@@ -54,9 +25,14 @@ async function execute(interaction: ChatInputCommandInteraction) {
   let expiresAt: Date | null = null;
   if (durationStr) {
     const ms = parseDuration(durationStr);
-    if (ms !== null) {
-      expiresAt = new Date(Date.now() + ms);
+    if (ms === null) {
+      await interaction.reply({
+        content: 'Invalid duration. Use a positive value followed by s, m, h, d, or w (for example, `2d`).',
+        ephemeral: true,
+      });
+      return;
     }
+    expiresAt = new Date(Date.now() + ms);
   }
 
   await prisma.ticketBlacklist.upsert({

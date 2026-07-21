@@ -2,6 +2,7 @@
 import { getTicketMode, TicketMode } from '../utils/ticketModeSettings.js';
 import { createTicketChannel } from './ticketHandlers.js';
 import { createTicketThread } from './threadTicketHandlers.js';
+import { withTicketCreationGuard } from '../utils/ticketCreationGuard.js';
 
 /**
  * Creates a ticket using the current mode.
@@ -20,9 +21,13 @@ export async function createTicket(
   data: { title: string; description: string; banType?: string },
   shouldDefer: boolean = true
 ) {
-  if (getTicketMode() === TicketMode.THREAD_BASED) {
-    return await createTicketThread(interaction, ticketType, data, shouldDefer);
-  } else {
-    return await createTicketChannel(interaction, ticketType, data, shouldDefer);
-  }
+  const userId = interaction.user?.id;
+  if (!userId) throw new Error('Ticket creation requires an authenticated Discord user.');
+
+  return withTicketCreationGuard(userId, async () => {
+    if (getTicketMode() === TicketMode.THREAD_BASED) {
+      return createTicketThread(interaction, ticketType, data, shouldDefer);
+    }
+    return createTicketChannel(interaction, ticketType, data, shouldDefer);
+  });
 }

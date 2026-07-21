@@ -1,9 +1,18 @@
-import { Client, Collection } from 'discord.js';
+import type {
+  AutocompleteInteraction,
+  ChatInputCommandInteraction,
+  Client,
+  Collection,
+  RESTPostAPIChatInputApplicationCommandsJSONBody,
+} from 'discord.js';
 
 export interface CommandModule {
-  data: any; 
-  execute: (interaction: any) => Promise<void>;
-  autocomplete?: (interaction: any) => Promise<void>;
+  data: {
+    readonly name: string;
+    toJSON(): RESTPostAPIChatInputApplicationCommandsJSONBody;
+  };
+  execute: (interaction: ChatInputCommandInteraction) => Promise<void>;
+  autocomplete?: (interaction: AutocompleteInteraction) => Promise<void>;
 }
 
 export interface ExtendedClient extends Client {

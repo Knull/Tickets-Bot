@@ -7,16 +7,15 @@ import {
   ActionRowBuilder,
   ButtonBuilder,
   ButtonStyle,
-  OverwriteResolvable,
-  PermissionsBitField,
   ButtonInteraction,
-  ModalSubmitInteraction,
   ChatInputCommandInteraction
 } from 'discord.js';
 import config from '../config/config.js';
 import prisma from '../utils/database.js';
 import { shouldPingRoles } from '../utils/ticketModeSettings.js';
-import { getCategoryId } from '../utils/discordUtils.js';
+import { reserveTicketNumber } from '../utils/ticketNumber.js';
+import { memberHasRole } from '../utils/memberRoles.js';
+import { ACTIVE_TICKET_STATUSES } from '../utils/ticketPolicy.js';
 
 export async function createTicketThread(
   interaction: any,
@@ -34,12 +33,10 @@ export async function createTicketThread(
   if (shouldDefer && !interaction.deferred) {
     await interaction.deferReply({ ephemeral: true });
   }
-  const settings = await prisma.ticketSettings.findUnique({ where: { id: 1 } });
-  let ticketCounter = settings?.ticketCounter || 1;
-  const prefix = '┃';
+  const ticketCounter = await reserveTicketNumber();
   const username = user.username.split(/[\s\W_]+/)[0] || user.username;
 
-  const isSpecial = interaction.member.roles.cache.has(config.boosterRoleId);
+  const isSpecial = memberHasRole(interaction.member, config.boosterRoleId);
   let threadName: string;
   if (isSpecial) {
     threadName = `🔥Priority Support・${username}`;
@@ -57,27 +54,10 @@ export async function createTicketThread(
   }
 
   const configEntry = await prisma.ticketConfig.findUnique({ where: { ticketType: effectiveTicketType } });
-  if (!configEntry || !Array.isArray(configEntry.permissions) || !configEntry.permissions.length) {
-    throw new Error(`No permissions found in DB for ticketType ${effectiveTicketType}`);
+  if (!configEntry || !Array.isArray(configEntry.permissions)) {
+    throw new Error(`No permission configuration found for ticket type ${effectiveTicketType}`);
   }
   const allowedRoleIds = configEntry.permissions as string[];
-
-  // stopped using
-  const permissionOverwrites: OverwriteResolvable[] = [
-    {
-      id: guild.id,
-      deny: [PermissionsBitField.Flags.ViewChannel, PermissionsBitField.Flags.SendMessages],
-    },
-    ...allowedRoleIds.map(roleId => ({
-      id: roleId,
-      allow: [PermissionsBitField.Flags.ViewChannel, PermissionsBitField.Flags.SendMessages],
-    })),
-  ];
-
-  const parentCategoryId = getCategoryId(effectiveTicketType);
-  if (!parentCategoryId) {
-    throw new Error(`Parent category not set for ${effectiveTicketType}`);
-  }
 
   const baseChannel = await guild.channels.fetch(config.ticketsChannelId);
   if (!baseChannel || !baseChannel.isTextBased()) {
@@ -91,8 +71,12 @@ export async function createTicketThread(
     type: ChannelType.PrivateThread,
     reason: 'Ticket creation (private thread)',
   });
+  let outsideMsgId: string | undefined;
+  try {
 
-  let rolePings = allowedRoleIds.map(roleId => `||<@&${roleId}>||`).join(' ');
+  const rolePings = shouldPingRoles()
+    ? allowedRoleIds.map(roleId => `||<@&${roleId}>||`).join(' ')
+    : '';
   const welcomeMessage = `Hey <@${user.id}> 👋! ${rolePings}\n\`\`\`Please wait patiently for staff to reply. If no one responds, you may ping staff. Thanks!\`\`\``;
   await thread.send(welcomeMessage);
 
@@ -153,7 +137,6 @@ export async function createTicketThread(
     await sentMsg.pin().catch(e => console.error('Error pinning partnership embed:', e));
   }
 
-  let outsideMsgId: string | undefined = undefined;
   const announcementChannel = await guild.channels.fetch(config.ticketsChannelId2);
   if (announcementChannel && announcementChannel.isTextBased()) {
     const announceChannel = announcementChannel as TextChannel;
@@ -196,20 +179,28 @@ export async function createTicketThread(
     },
   });
 
-  await prisma.ticketSettings.update({
-    where: { id: 1 },
-    data: { ticketCounter: ticketCounter + 1 },
-  });
-
   if (shouldDefer) {
     await interaction.editReply({
       content: `Your ticket has been opened. Head over to <#${thread.id}> to continue.`,
     }).catch(() => {});
   }
   return thread;
+  } catch (error) {
+    if (outsideMsgId) {
+      const announcementChannel = await guild.channels.fetch(config.ticketsChannelId2).catch(() => null);
+      if (announcementChannel?.isTextBased()) {
+        await announcementChannel.messages.delete(outsideMsgId).catch(() => undefined);
+      }
+    }
+    await thread.delete('Rolling back failed ticket creation.').catch(rollbackError => {
+      console.error(`Failed to clean up ticket thread ${thread.id}:`, rollbackError);
+    });
+    throw error;
+  }
 }
 // defer all updates
 export async function handleCloseThread(interaction: ButtonInteraction): Promise<void> {
+  let closedTicket: { id: number; previousStatus: string } | undefined;
   try {
     await interaction.deferReply({ ephemeral: true });
     const channel = interaction.channel;
@@ -218,6 +209,20 @@ export async function handleCloseThread(interaction: ButtonInteraction): Promise
       return;
     }
     const thread = channel as ThreadChannel;
+    const ticket = await prisma.ticket.findFirst({ where: { channelId: thread.id } });
+    if (!ticket) {
+      await interaction.followUp({ content: 'Ticket record not found.', ephemeral: true });
+      return;
+    }
+    const close = await prisma.ticket.updateMany({
+      where: { id: ticket.id, status: { in: [...ACTIVE_TICKET_STATUSES] } },
+      data: { status: 'closed', transcriptUrl: thread.url },
+    });
+    if (close.count === 0) {
+      await interaction.followUp({ content: 'This ticket has already been processed.', ephemeral: true });
+      return;
+    }
+    closedTicket = { id: ticket.id, previousStatus: ticket.status };
 
     await thread.setLocked(true, 'Ticket closed.');
 
@@ -242,8 +247,7 @@ export async function handleCloseThread(interaction: ButtonInteraction): Promise
     );
     await thread.send({ embeds: [closeEmbed], components: [row] });
 
-    const ticket = await prisma.ticket.findFirst({ where: { channelId: thread.id } });
-    if (ticket && ticket.outsideMessageId) {
+    if (ticket.outsideMessageId) {
       const baseChannel = await interaction.guild?.channels.fetch(config.ticketsChannelId2);
       if (baseChannel && baseChannel.isTextBased()) {
         const textChannel = baseChannel as TextChannel;
@@ -257,14 +261,9 @@ export async function handleCloseThread(interaction: ButtonInteraction): Promise
       }
     }
 
-    await prisma.ticket.updateMany({
-      where: { channelId: thread.id },
-      data: { status: 'closed', transcriptUrl: thread.url }
-    });
-
     let ticketCreator: any = null;
     try {
-      ticketCreator = await interaction.guild?.members.fetch(ticket!.userId);
+      ticketCreator = await interaction.guild?.members.fetch(ticket.userId);
     } catch (err) {
       console.error("Error fetching ticket creator:", err);
     }
@@ -278,10 +277,10 @@ export async function handleCloseThread(interaction: ButtonInteraction): Promise
 
     const logEmbed = new EmbedBuilder()
       .setAuthor({
-        name: `${ticket!.ticketType} Ticket`,
+        name: `${ticket.ticketType} Ticket`,
         iconURL: interaction.guild?.iconURL() || ''
       })
-      .setTitle(`${ticket!.ticketNumber} | ${ticketCreator ? ticketCreator.user.username : ticket!.userId}`)
+      .setTitle(`${ticket.ticketNumber} | ${ticketCreator ? ticketCreator.user.username : ticket.userId}`)
       .setDescription(
         `> Ticket Claimed ➤ <t:${nowTs}:F>\n` +
         `> Claimed By ➤ <@${interaction.user.id}>\n` +
@@ -291,7 +290,7 @@ export async function handleCloseThread(interaction: ButtonInteraction): Promise
 
 
     const advancedButton = new ButtonBuilder()
-      .setCustomId(`advanced_ticketLog_${ticket!.id}`)
+      .setCustomId(`advanced_ticketLog_${ticket.id}`)
       .setLabel('Advanced')
       .setStyle(ButtonStyle.Danger)
       .setEmoji('⚙️');
@@ -313,7 +312,7 @@ export async function handleCloseThread(interaction: ButtonInteraction): Promise
     }
 
     if (logLink) {
-      await prisma.ticket.update({ where: { id: ticket!.id }, data: { logMessageUrl: logLink } });
+      await prisma.ticket.update({ where: { id: ticket.id }, data: { logMessageUrl: logLink } });
     }
 
     if (ticketCreator) {
@@ -323,13 +322,21 @@ export async function handleCloseThread(interaction: ButtonInteraction): Promise
         console.error("Error sending DM to ticket creator:", dmError);
       }
     }
+    closedTicket = undefined;
     await interaction.followUp({ content: 'Ticket has been closed (thread locked).', ephemeral: true });
   } catch (error) {
     console.error('Error in handleCloseThread:', error);
+    if (closedTicket) {
+      await prisma.ticket.updateMany({
+        where: { id: closedTicket.id, status: 'closed' },
+        data: { status: closedTicket.previousStatus },
+      }).catch(rollbackError => console.error('Failed to restore ticket status:', rollbackError));
+    }
     await interaction.followUp({ content: 'Failed to close ticket.', ephemeral: true });
   }
 }
 export async function handleReopenThread(interaction: ButtonInteraction): Promise<void> {
+  let reopenedTicketId: number | undefined;
   try {
     await interaction.deferReply({ ephemeral: true });
     const channel = interaction.channel;
@@ -338,30 +345,32 @@ export async function handleReopenThread(interaction: ButtonInteraction): Promis
       return;
     }
     const thread = channel as ThreadChannel;
-
-    await thread.setLocked(false, 'Ticket reopened.');
-
     const ticket = await prisma.ticket.findFirst({ where: { channelId: thread.id } });
     if (!ticket) {
       await interaction.followUp({ content: 'Ticket record not found.', ephemeral: true });
       return;
     }
-    await prisma.ticket.update({
-      where: { id: ticket.id },
-      data: {
-        status: 'open',
-        lastMessageAt: new Date() // reset inactivity timer on reopen
-      }
+    const reopen = await prisma.ticket.updateMany({
+      where: { id: ticket.id, status: 'closed' },
+      data: { status: 'reopened', lastMessageAt: new Date() },
     });
+    if (reopen.count === 0) {
+      await interaction.followUp({ content: 'This ticket is not closed or has already been reopened.', ephemeral: true });
+      return;
+    }
+    reopenedTicketId = ticket.id;
+
+    await thread.setLocked(false, 'Ticket reopened.');
     try {
       const storedMsg = await thread.messages.fetch(ticket.ticketMessageId!);
       const updatedComponents = storedMsg.components.map(row => {
-        const newRow = row.toJSON();
-        newRow.components = newRow.components.map(comp => {
-          if ('custom_id' in comp && comp.custom_id === 'close_thread') {
-            comp.disabled = false;
+        const newRow = structuredClone(row.toJSON()) as any;
+        if (!Array.isArray(newRow.components)) return newRow;
+        newRow.components = newRow.components.map((component: any) => {
+          if (component.custom_id === 'close_thread') {
+            component.disabled = false;
           }
-          return comp;
+          return component;
         });
         return newRow;
       });
@@ -371,12 +380,13 @@ export async function handleReopenThread(interaction: ButtonInteraction): Promis
     }
     try {
       const currentComponents = interaction.message.components.map(row => {
-        const newRow = row.toJSON();
-        newRow.components = newRow.components.map(comp => {
-          if ('custom_id' in comp && comp.custom_id === 'reopen_thread') {
-            comp.disabled = true;
+        const newRow = structuredClone(row.toJSON()) as any;
+        if (!Array.isArray(newRow.components)) return newRow;
+        newRow.components = newRow.components.map((component: any) => {
+          if (component.custom_id === 'reopen_thread') {
+            component.disabled = true;
           }
-          return comp;
+          return component;
         });
         return newRow;
       });
@@ -434,13 +444,21 @@ export async function handleReopenThread(interaction: ButtonInteraction): Promis
       const announcementRow = new ActionRowBuilder<ButtonBuilder>().addComponents(accessButton);
       await announceChannel.send({ content: announcementContent, components: [announcementRow] });
     }
+    reopenedTicketId = undefined;
     await interaction.followUp({ content: 'Ticket has been reopened.', ephemeral: true });
   } catch (error) {
     console.error('Error in handleReopenThread:', error);
+    if (reopenedTicketId !== undefined) {
+      await prisma.ticket.updateMany({
+        where: { id: reopenedTicketId, status: 'reopened' },
+        data: { status: 'closed' },
+      }).catch(rollbackError => console.error('Failed to restore ticket status:', rollbackError));
+    }
     await interaction.followUp({ content: 'Failed to reopen ticket.', ephemeral: true });
   }
 }
 export async function handleCloseThreadCommand(interaction: ChatInputCommandInteraction): Promise<void> {
+  let closedTicket: { id: number; previousStatus: string } | undefined;
   try {
     await interaction.deferReply({ ephemeral: true });
     const channel = interaction.channel;
@@ -449,13 +467,27 @@ export async function handleCloseThreadCommand(interaction: ChatInputCommandInte
       return;
     }
     const thread = channel as ThreadChannel;
+    const ticket = await prisma.ticket.findFirst({ where: { channelId: thread.id } });
+    if (!ticket) {
+      await interaction.followUp({ content: 'Ticket record not found.', ephemeral: true });
+      return;
+    }
+    const close = await prisma.ticket.updateMany({
+      where: { id: ticket.id, status: { in: [...ACTIVE_TICKET_STATUSES] } },
+      data: { status: 'closed', transcriptUrl: thread.url },
+    });
+    if (close.count === 0) {
+      await interaction.followUp({ content: 'This ticket has already been processed.', ephemeral: true });
+      return;
+    }
+    closedTicket = { id: ticket.id, previousStatus: ticket.status };
+
     await thread.setLocked(true, 'Ticket closed.');
     if (thread.name.startsWith('🟢')) {
       const newName = '🔴' + thread.name.slice(2);
       await thread.setName(newName);
     }
-    const ticket = await prisma.ticket.findFirst({ where: { channelId: thread.id } });
-    if (ticket) {
+    {
       const usersToRemove: string[] = [];
       if (ticket.userId) {
         usersToRemove.push(ticket.userId);
@@ -483,7 +515,7 @@ export async function handleCloseThreadCommand(interaction: ChatInputCommandInte
         .setDisabled(false)
     );
     await thread.send({ embeds: [closeEmbed], components: [row] });
-    if (ticket && ticket.outsideMessageId) {
+    if (ticket.outsideMessageId) {
       const baseChannel = await interaction.guild?.channels.fetch(config.ticketsChannelId2);
       if (baseChannel && baseChannel.isTextBased()) {
         const textChannel = baseChannel as TextChannel;
@@ -496,13 +528,9 @@ export async function handleCloseThreadCommand(interaction: ChatInputCommandInte
         }
       }
     }
-    await prisma.ticket.updateMany({
-      where: { channelId: thread.id },
-      data: { status: 'closed', transcriptUrl: thread.url }
-    });
     let ticketCreator: any = null;
     try {
-      ticketCreator = await interaction.guild?.members.fetch(ticket!.userId);
+      ticketCreator = await interaction.guild?.members.fetch(ticket.userId);
     } catch (err) {
       console.error("Error fetching ticket creator:", err);
     }
@@ -512,10 +540,10 @@ export async function handleCloseThreadCommand(interaction: ChatInputCommandInte
     const logChannel = await interaction.guild?.channels.fetch(transcriptChannelId) as TextChannel;
     const logEmbed = new EmbedBuilder()
       .setAuthor({
-        name: `${ticket!.ticketType} Ticket`,
+        name: `${ticket.ticketType} Ticket`,
         iconURL: interaction.guild?.iconURL() || ''
       })
-      .setTitle(`${ticket!.ticketNumber} | ${ticketCreator ? ticketCreator.user.username : ticket!.userId}`)
+      .setTitle(`${ticket.ticketNumber} | ${ticketCreator ? ticketCreator.user.username : ticket.userId}`)
       .setDescription(
         `> Ticket Claimed ➤ <t:${nowTs}:F>\n` +
         `> Claimed By ➤ <@${interaction.user.id}>\n` +
@@ -524,7 +552,7 @@ export async function handleCloseThreadCommand(interaction: ChatInputCommandInte
       .setTimestamp();
 
     const advancedButton = new ButtonBuilder()
-      .setCustomId(`advanced_ticketLog_${ticket!.id}`)
+      .setCustomId(`advanced_ticketLog_${ticket.id}`)
       .setLabel('Advanced')
       .setStyle(ButtonStyle.Danger)
       .setEmoji('⚙️');
@@ -545,7 +573,7 @@ export async function handleCloseThreadCommand(interaction: ChatInputCommandInte
       logLink = `https://discord.com/channels/${interaction.guildId}/${logChannel.id}/${sent.id}`;
     }
     if (logLink) {
-      await prisma.ticket.update({ where: { id: ticket!.id }, data: { logMessageUrl: logLink } });
+      await prisma.ticket.update({ where: { id: ticket.id }, data: { logMessageUrl: logLink } });
     }
     if (ticketCreator) {
       try {
@@ -554,9 +582,16 @@ export async function handleCloseThreadCommand(interaction: ChatInputCommandInte
         console.error("Error sending DM to ticket creator:", dmError);
       }
     }
+    closedTicket = undefined;
     await interaction.followUp({ content: 'Ticket has been closed (thread locked).', ephemeral: true });
   } catch (error) {
     console.error('Error in handleCloseThreadCommand:', error);
+    if (closedTicket) {
+      await prisma.ticket.updateMany({
+        where: { id: closedTicket.id, status: 'closed' },
+        data: { status: closedTicket.previousStatus },
+      }).catch(rollbackError => console.error('Failed to restore ticket status:', rollbackError));
+    }
     await interaction.followUp({ content: 'Failed to close ticket.', ephemeral: true });
   }
 }

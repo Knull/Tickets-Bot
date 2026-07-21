@@ -1,15 +1,19 @@
 {
   "compilerOptions": {
-    "target": "ES2020",
+    "target": "ES2023",
     "module": "NodeNext",
     "moduleResolution": "NodeNext",
     "strict": true,
     "esModuleInterop": true,
     "skipLibCheck": true,
     "forceConsistentCasingInFileNames": true,
+    "noUncheckedIndexedAccess": true,
+    "noImplicitOverride": true,
+    "noUnusedLocals": true,
+    "sourceMap": true,
     "rootDir": "src",
     "outDir": "dist"
   },
-  "include": ["src/**/*"],
+  "include": ["src/**/*.ts"],
   "exclude": ["dist", "node_modules"]
 }

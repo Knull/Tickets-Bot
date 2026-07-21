@@ -1,4 +1,3 @@
-// this file has been commented out in index.js and there is a reason. The first time you start the bot un-comment this file. This is just to populate the database to ensure any bugs that stem from this don't occur. Comment this file out immediately if you plan to restart the bot.
 import prisma from './database.js';
 
 export async function populateTicketConfigs(): Promise<void> {
@@ -74,9 +73,9 @@ Server must be Minecraft related (exceptions can be made, e.g., for performance 
   for (const cfg of defaultConfigs) {
     await prisma.ticketConfig.upsert({
       where: { ticketType: cfg.ticketType },
-      update: cfg,
+      // Seed missing rows without overwriting administrator customizations.
+      update: {},
       create: cfg,
     });
   }
-  console.log('TicketConfig table populated with default records.');
 }

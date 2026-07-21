@@ -1,4 +1,24 @@
-/src/transcripts/venv
+# Dependencies and generated output
+node_modules/
+dist/
+src/generated/
+coverage/
+
+# Local configuration and secrets
+.env
+.env.*
+!.env.example
+src/prisma/.env
+
+# Runtime artifacts
+transcripts/
+*.log
 *.pyc
-/src/transcripts/venv
-/src/transcripts/venv
+__pycache__/
+.venv/
+venv/
+
+# Editor and operating-system files
+.DS_Store
+.idea/
+.vscode/

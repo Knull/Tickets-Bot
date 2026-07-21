@@ -1,6 +1,7 @@
 import { SlashCommandBuilder, ChatInputCommandInteraction, EmbedBuilder } from 'discord.js';
 import prisma from '../utils/database.js';
 import config from '../config/config.js';
+import { memberHasRole } from '../utils/memberRoles.js';
 
 const data = new SlashCommandBuilder()
   .setName('ticket_unblacklist')
@@ -8,17 +9,7 @@ const data = new SlashCommandBuilder()
   .addUserOption(opt => opt.setName('user').setDescription('User to unblacklist').setRequired(true));
 
 async function execute(interaction: ChatInputCommandInteraction) {
-  const member = interaction.member;
-  if (!member) {
-    await interaction.reply({ content: `Only <@&${config.adminRoleId}> can use this command.`, ephemeral: true });
-    return;
-  }
-  const roles = (member as any).roles;
-  if (!('cache' in roles)) {
-    await interaction.reply({ content: `Only <@&${config.adminRoleId}> can use this command.`, ephemeral: true });
-    return;
-  }
-  if (!roles.cache.has(config.adminRoleId)) {
+  if (!memberHasRole(interaction.member, config.adminRoleId)) {
     await interaction.reply({ content: `Only <@&${config.adminRoleId}> can use this command.`, ephemeral: true });
     return;
   }

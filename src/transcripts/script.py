@@ -4,7 +4,6 @@ import chat_exporter
 import argparse
 import asyncio
 import os
-from discord.utils import snowflake_time
 
 async def export_chat_range(token, channel_id, output_file, start_msg_id, end_msg_id, tz_info="UTC", military_time=False):
     intents = discord.Intents.default()
@@ -79,7 +78,11 @@ async def export_chat_range(token, channel_id, output_file, start_msg_id, end_ms
 
 def main():
     parser = argparse.ArgumentParser(description="Export a Discord channel transcript for a specific message range")
-    parser.add_argument("--token", required=True, help="Discord bot token")
+    parser.add_argument(
+        "--token",
+        default=os.environ.get("DISCORD_TOKEN"),
+        help="Discord bot token (defaults to DISCORD_TOKEN)",
+    )
     parser.add_argument("--channel_id", type=int, required=True, help="Discord channel ID")
     parser.add_argument("--start", required=True, help="Start message ID (inclusive)")
     parser.add_argument("--end", required=True, help="End message ID (inclusive)")
@@ -87,10 +90,10 @@ def main():
     parser.add_argument("--tz_info", type=str, default="UTC", help="Timezone info")
     parser.add_argument("--military_time", action="store_true", help="Use 24-hour time format")
     args = parser.parse_args()
-    
-    loop = asyncio.new_event_loop()
-    asyncio.set_event_loop(loop)
-    loop.run_until_complete(
+    if not args.token:
+        parser.error("DISCORD_TOKEN or --token is required")
+
+    asyncio.run(
         export_chat_range(args.token, args.channel_id, args.output_file,
                           args.start, args.end, args.tz_info, args.military_time)
     )

@@ -1,12 +1,10 @@
 // src/dropdowns/appealDropdown.ts
 import {
-  ButtonInteraction,
   StringSelectMenuInteraction,
   EmbedBuilder,
   ActionRowBuilder,
-  StringSelectMenuBuilder,
-  SelectMenuBuilder
-} from 'discord.js';;
+  StringSelectMenuBuilder
+} from 'discord.js';
 
 export async function showInitialAppealDropdown(
   interaction: any,

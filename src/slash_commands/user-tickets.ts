@@ -1,6 +1,7 @@
 import { SlashCommandBuilder, ChatInputCommandInteraction, EmbedBuilder } from 'discord.js';
 import prisma from '../utils/database.js';
 import config from '../config/config.js';
+import { memberHasRole } from '../utils/memberRoles.js';
 
 const data = new SlashCommandBuilder()
   .setName('user-tickets')
@@ -11,15 +12,7 @@ const data = new SlashCommandBuilder()
 
 async function execute(interaction: ChatInputCommandInteraction) {
   const target = interaction.options.getUser('user', true);
-  if (!interaction.member || !('roles' in interaction.member)) {
-    await interaction.reply({ content: 'Member not found.', ephemeral: true });
-    return;
-  }
-  const memberRoles: any = interaction.member.roles;
-  const hasStaff = ('cache' in memberRoles)
-    ? memberRoles.cache.has(config.staffRoleId)
-    : Array.isArray(memberRoles) && memberRoles.includes(config.staffRoleId);
-  if (!hasStaff) {
+  if (!memberHasRole(interaction.member, config.staffRoleId)) {
     await interaction.reply({ content: 'You are not authorized to use this command.', ephemeral: true });
     return;
   }

@@ -1,25 +1,14 @@
 import { 
-  StringSelectMenuInteraction, 
-  RoleSelectMenuInteraction, 
-  ButtonStyle, 
-  ButtonBuilder, 
-  EmbedBuilder, 
-  ActionRowBuilder, 
-  Role 
+  StringSelectMenuInteraction
 } from 'discord.js';
 import { showBanTypeDropdown } from '../dropdowns/appealDropdown.js';
 import { showAppealReasonModal, showBanAppealModal } from '../modals/appealReasonModal.js';
 import { showAppealAltModal } from '../modals/appealAltModal.js';
-import winston from 'winston';
 import { handleConfigPermissions } from '../commands/ticketConfigPermissions.js';
-const logger = winston.createLogger({
-  transports: [new winston.transports.Console()]
-});
 
 // Handlers for string select menus
 export const StringSelectHandlers: { [key: string]: (interaction: StringSelectMenuInteraction) => Promise<void> } = {
   'appeal_initial': async (interaction: StringSelectMenuInteraction) => {
-    logger.info(`Dropdown selected: ${interaction.customId}`);
     const selected = interaction.values[0];
     if (selected === 'appeal_ban') {
       await showBanTypeDropdown(interaction);
@@ -30,7 +19,6 @@ export const StringSelectHandlers: { [key: string]: (interaction: StringSelectMe
     }
   },
   'ban_type': async (interaction: StringSelectMenuInteraction) => {
-    logger.info(`Dropdown selected: ${interaction.customId}`);
     const selected = interaction.values[0];
     if (selected === 'banned_alt') {
       await showAppealAltModal(interaction);
@@ -43,5 +31,3 @@ export const StringSelectHandlers: { [key: string]: (interaction: StringSelectMe
   'config_permissions_': handleConfigPermissions,
 
 };
-
-

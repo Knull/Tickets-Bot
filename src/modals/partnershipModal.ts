@@ -10,8 +10,9 @@ import {
 } from 'discord.js';
 import { createTicket } from '../handlers/ticketCreationDispatcher.js';
 import prisma from '../utils/database.js';
+import { TicketCreationBlockedError } from '../utils/ticketCreationGuard.js';
 
-export function showPartnershipModal(interaction: any): void {
+export async function showPartnershipModal(interaction: { showModal(modal: ModalBuilder): Promise<unknown> }): Promise<void> {
   const modal = new ModalBuilder()
     .setCustomId('partnership_modal')
     .setTitle('Partnership Application');
@@ -20,18 +21,21 @@ export function showPartnershipModal(interaction: any): void {
     .setCustomId('server_name')
     .setLabel('Name of your server')
     .setStyle(TextInputStyle.Short)
+    .setMaxLength(100)
     .setRequired(true);
 
   const inviteInput = new TextInputBuilder()
     .setCustomId('invite_link')
     .setLabel('Invite Link')
     .setStyle(TextInputStyle.Short)
+    .setMaxLength(200)
     .setRequired(true);
 
   const reasonInput = new TextInputBuilder()
     .setCustomId('reason')
     .setLabel('Reason for partnership')
     .setStyle(TextInputStyle.Paragraph)
+    .setMaxLength(3_000)
     .setRequired(true);
 
   modal.addComponents(
@@ -40,54 +44,41 @@ export function showPartnershipModal(interaction: any): void {
     new ActionRowBuilder<TextInputBuilder>().addComponents(reasonInput)
   );
 
-  interaction.showModal(modal);
+  await interaction.showModal(modal);
 }
 
 export async function handlePartnershipModal(interaction: ModalSubmitInteraction): Promise<void> {
-  try {
-    await interaction.deferReply({ flags: MessageFlags.Ephemeral });
-  } catch (error) {
-    console.error("Error deferring modal interaction:", error);
-  }
+  await interaction.deferReply({ flags: MessageFlags.Ephemeral });
   
-  const serverName = interaction.fields.getTextInputValue('server_name');
-  const inviteLink = interaction.fields.getTextInputValue('invite_link');
-  const reason = interaction.fields.getTextInputValue('reason');
-  console.log(`Received partnership modal submission:
-    Server Name: ${serverName}
-    Invite Link: ${inviteLink}
-    Reason: ${reason}`);
+  const serverName = interaction.fields.getTextInputValue('server_name').trim();
+  const inviteLink = interaction.fields.getTextInputValue('invite_link').trim();
+  const reason = interaction.fields.getTextInputValue('reason').trim();
   
-  // Validate the invite link.
-  // update: if you're reading this there are better ways to do this, I will leave it up to you to figure them out. 
   let invite;
   try {
-    invite = await interaction.client.fetchInvite(inviteLink, { withCounts: true } as any);
+    invite = await interaction.client.fetchInvite(inviteLink);
   } catch (error) {
     console.error("Error fetching invite:", error);
     const errorEmbed = new EmbedBuilder()
       .setColor(0xff0000)
       .setDescription(`> The invite link provided is invalid. Please try again.`);
-    await interaction.followUp({ embeds: [errorEmbed], flags: MessageFlags.Ephemeral });
+    await interaction.editReply({ embeds: [errorEmbed] });
     return;
   }
   
-  const inviteData = invite as any;
-  if (!inviteData.guild || !inviteData.channel) {
+  if (!invite.guild || !invite.channel) {
     console.error("Fetched invite does not include expected properties.");
     const errorEmbed = new EmbedBuilder()
       .setColor(0xff0000)
       .setDescription(`> The invite link provided is missing required data. Please try again with a proper guild invite.`);
-    await interaction.followUp({ embeds: [errorEmbed], flags: MessageFlags.Ephemeral });
+    await interaction.editReply({ embeds: [errorEmbed] });
     return;
   }
   
-  let memberCount = inviteData.approximateMemberCount || 0;
+  const memberCount = invite.memberCount || 0;
   if (memberCount === 0) {
     console.warn("Member count is 0; this may be because the bot is not in the target guild.");
   }
-  console.log(`Fetched member count: ${memberCount}`);
-  // these were just experiments; I have not removed them because it doesn't hurt to try.
   let eligibilityText = '';
   if (memberCount < 500) {
     eligibilityText = 'Small server partnership';
@@ -96,40 +87,23 @@ export async function handlePartnershipModal(interaction: ModalSubmitInteraction
   } else {
     eligibilityText = 'Eligible for standard partnership options';
   }
-  console.log(`Eligibility determined: ${eligibilityText}`);
-  
-  // Fetch partnership instructions from TicketConfig.
-  // update: this is not hard-coded anymore. 
-  const configEntry = await prisma.ticketConfig.findUnique({ where: { ticketType: "Partnership" } });
-  const partnershipInstructions = configEntry && configEntry.useCustomInstructions && configEntry.instructions
-    ? configEntry.instructions
-    : `### PRBW is no longer doing free partnerships.
-    
-Server must be Minecraft related (exceptions can be made, e.g., for performance enhancing softwares).
-- **Server must have 1,000+ members. (In this case, we'll do a NoPing4Ping partnership, where you have to ping for our advertisement but we won't)**
-- **For a Ping4Ping or a partnership with a smaller server, the prices are given below:**
-\`\`\`arm
-1. Simple Ping4Ping partnership, if your server is above 1000 members will cost $15 USD.
-2. A Ping4Ping partnership with smaller servers may cost up to $20 USD.
-3. A Ping4Ping CAN BE FREE for servers with 1.25x the number of members of PRBW.
-4. A simple partnership with no pings for servers of any member count will cost $10 USD.
-\`\`\``;
-  
+
   const ticketData = {
     title: 'Partnership Ticket',
-    description: `${reason}`  // User input for the modal.
+    description: `Server: ${serverName}\nApproximate members: ${memberCount || 'Unknown'}\n\nReason: ${reason}`,
   };
   
   let ticketChannel;
   try {
     // Use the dispatcher to create the ticket channel or thread.
     ticketChannel = await createTicket(interaction, 'Partnership', ticketData, false);
-    console.log(`Created ticket channel with ID: ${ticketChannel.id}`);
   } catch (error) {
     console.error('Failed to create partnership ticket:', error);
     const errEmbed = new EmbedBuilder()
       .setColor(0xff0000)
-      .setDescription('> There was an error creating your partnership ticket. Please try again later.');
+      .setDescription(error instanceof TicketCreationBlockedError
+        ? `> ${error.userMessage}`
+        : '> There was an error creating your partnership ticket. Please try again later.');
     try {
       await interaction.editReply({ embeds: [errEmbed] });
     } catch (err) {
@@ -137,10 +111,14 @@ Server must be Minecraft related (exceptions can be made, e.g., for performance 
     }
     return;
   }
+
+  await prisma.ticket.updateMany({
+    where: { channelId: ticketChannel.id },
+    data: { inviteLink },
+  });
   
   try {
     await ticketChannel.send(`Server Invite: ${inviteLink}`);
-    console.log("Sent invite link message to ticket channel.");
   } catch (error) {
     console.error(`Error sending invite link message: ${error}`);
   }
@@ -151,7 +129,6 @@ Server must be Minecraft related (exceptions can be made, e.g., for performance 
       .setDescription(`> You are Eligible for:\n- ${eligibilityText}`);
     try {
       await ticketChannel.send({ content: `<@${interaction.user.id}>`, embeds: [eligibilityEmbed] });
-      console.log("Sent eligibility embed.");
     } catch (error) {
       console.error(`Error sending eligibility embed: ${error}`);
     }

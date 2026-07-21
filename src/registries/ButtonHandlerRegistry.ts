@@ -1,14 +1,11 @@
-import { ButtonInteraction, Client, PermissionFlagsBits, OverwriteType, ModalBuilder, TextInputBuilder, ActionRowBuilder, TextInputStyle } from 'discord.js';
+import { ButtonInteraction, Client, MessageFlags, ModalBuilder, TextInputBuilder, ActionRowBuilder, TextInputStyle } from 'discord.js';
 import prisma from '../utils/database.js';
 import { showPartnershipModal } from '../modals/partnershipModal.js';
 import { handleCreateGeneralTicket } from '../handlers/createTicketHandlers.js';
-import { createTicketChannel } from '../handlers/ticketHandlers.js';
 import { showInitialAppealDropdown } from '../dropdowns/appealDropdown.js';
-import winston from 'winston';
 import { instructionsCache } from '../utils/instructionsCache.js';
-import { getPermissionOverwrites } from '../utils/discordUtils.js';
 import { confirmTicketConfigPermissions, cancelTicketConfigPermissions } from '../handlers/ticketPermissionHandlers.js'
-import { handleCloseTicket, handleReopenTicket, handleClaimTicket, handleDeleteTicketManual, handleDeleteTicketAuto, handleAdvancedTicketLog } from '../handlers/ticketHandlers.js';
+import { handleCloseTicket, handleReopenTicket, handleDeleteTicketAuto, handleAdvancedTicketLog } from '../handlers/ticketHandlers.js';
 import config from '../config/config.js';
 import { createTicket } from '../handlers/ticketCreationDispatcher.js';
 import {
@@ -16,73 +13,42 @@ import {
   handleTicketToggleConfirm,
   handleTicketToggleCancel,
 } from '../slash_commands/ticketToggleCommand.js';
-const logger = winston.createLogger({
-  transports: [new winston.transports.Console()]
-});
-import { RoleSelectCache } from '../utils/roleSelectCache.js';
 import { handleCloseThread, handleReopenThread } from '../handlers/threadTicketHandlers.js';
+import { getTicketCreationBlockReason } from '../utils/ticketCreationGuard.js';
+import { memberHasRole } from '../utils/memberRoles.js';
 
-async function checkBlacklist(interaction: ButtonInteraction): Promise<boolean> {
-  try {
-    const record = await prisma.ticketBlacklist.findUnique({ where: { userId: interaction.user.id } });
-    if (record) {
-      if (record.expiresAt && record.expiresAt < new Date()) {
-        await prisma.ticketBlacklist.delete({ where: { id: record.id } });
-      } else {
-        const msg = 'You are blacklisted from opening tickets.';
-        if (interaction.deferred || interaction.replied) {
-          await interaction.followUp({ content: msg, flags: 64 });
-        } else {
-          await interaction.reply({ content: msg, flags: 64 });
-        }
-        return true;
-      }
-    }
-  } catch (err) {
-    console.error('Error checking blacklist:', err);
-  }
-  return false;
-}
 async function checkTicketLimit(interaction: ButtonInteraction): Promise<boolean> {
   try {
-    if (await checkBlacklist(interaction)) return true;
-    const openTickets = await prisma.ticket.findMany({ where: { userId: interaction.user.id, status: 'open' } });
-    console.log(`User ${interaction.user.id} has ${openTickets.length} open tickets.`);
-    if (openTickets.length >= 2) {
-      try {
-        await interaction.followUp({ 
-          content: 'You already have 2 open tickets. Please continue in one of your existing ticket channels.',
-          flags: 64
-        });
-      } catch (replyError) {
-        console.error('Error replying in checkTicketLimit:', replyError);
+    const blockReason = await getTicketCreationBlockReason(interaction.user.id);
+    if (blockReason) {
+      if (interaction.deferred) {
+        await interaction.editReply({ content: blockReason, embeds: [], components: [] });
+      } else if (interaction.replied) {
+        await interaction.followUp({ content: blockReason, flags: MessageFlags.Ephemeral });
+      } else {
+        await interaction.reply({ content: blockReason, flags: MessageFlags.Ephemeral });
       }
       return true;
     }
     return false;
   } catch (error) {
     console.error('Error checking ticket limit:', error);
-    return true; // fail safe
+    const content = 'Ticket availability could not be checked. Please try again shortly.';
+    if (interaction.deferred) {
+      await interaction.editReply({ content, embeds: [], components: [] }).catch(() => undefined);
+    } else if (interaction.replied) {
+      await interaction.followUp({ content, flags: MessageFlags.Ephemeral }).catch(() => undefined);
+    } else {
+      await interaction.reply({ content, flags: MessageFlags.Ephemeral }).catch(() => undefined);
+    }
+    return true;
   }
 }
 
-export const ButtonHandlerRegistry: { [key: string]: (interaction: ButtonInteraction, client: any) => Promise<void> } = {
+export const ButtonHandlerRegistry: Record<string, (interaction: ButtonInteraction, client: Client) => Promise<void>> = {
   'create_general': async (interaction, client) => {
-  logger.info(`Handling create_general button`);
   try {
-    if (await checkBlacklist(interaction)) return;
-    const openTickets = await prisma.ticket.findMany({ 
-      where: { userId: interaction.user.id, status: 'open' } 
-    });
-    console.log(`User ${interaction.user.id} has ${openTickets.length} open tickets.`);
-    if (openTickets.length >= 2) {
-      // If 2 or more tickets exist, deny.
-      await interaction.reply({ 
-        content: 'You already have 2 open tickets. Please continue in one of your existing ticket channels.',
-        flags: 64  
-      });
-      return;
-    }
+    if (await checkTicketLimit(interaction)) return;
     // Otherwise, show the modal immediately.
     await handleCreateGeneralTicket(interaction, client);
   } catch (error) {
@@ -99,7 +65,6 @@ export const ButtonHandlerRegistry: { [key: string]: (interaction: ButtonInterac
 },
 
 'create_appeal': async (interaction, client) => {
-    logger.info(`Handling create_appeal button`);
     try {
       await interaction.deferReply({ flags: 64 });
     } catch (err) {
@@ -116,27 +81,13 @@ export const ButtonHandlerRegistry: { [key: string]: (interaction: ButtonInterac
   
   // Store ticket creation button
   'create_store': async (interaction, client) => {
-    logger.info(`Handling create_store button`);
     try {
       await interaction.deferReply({ flags: 64 });
     } catch (err) {
       console.error("Error deferring interaction in create_store handler:", err);
       return;
     }
-    if (await checkBlacklist(interaction)) return;
-    const openTickets = await prisma.ticket.findMany({ where: { userId: interaction.user.id, status: 'open' } });
-    console.log(`User ${interaction.user.id} has ${openTickets.length} open tickets.`);
-    if (openTickets.length >= 2) {
-      try {
-        await interaction.followUp({ 
-          content: 'You already have 2 open tickets. Please continue in one of your existing ticket channels.',
-          flags: 64
-        });
-      } catch (e) {
-        console.error('Error replying ticket limit for store:', e);
-      }
-      return;
-    }
+    if (await checkTicketLimit(interaction)) return;
     try {
       const data = { 
         title: 'Store Purchase', 
@@ -159,21 +110,8 @@ export const ButtonHandlerRegistry: { [key: string]: (interaction: ButtonInterac
 
   // Partnership ticket creation button
   'create_partnership': async (interaction, client) => {
-  logger.info(`Handling create_partnership button`);
   try {
-    if (await checkBlacklist(interaction)) return;
-    // Check the ticket limit immediately.
-    const openTickets = await prisma.ticket.findMany({
-      where: { userId: interaction.user.id, status: 'open' }
-    });
-    console.log(`User ${interaction.user.id} has ${openTickets.length} open tickets.`);
-    if (openTickets.length >= 2) {
-      await interaction.reply({ 
-        content: 'You already have 2 open tickets. Please continue in one of your existing ticket channels.',
-        flags: 64
-      });
-      return;
-    }
+    if (await checkTicketLimit(interaction)) return;
     // If under limit, immediately show the partnership modal.
     await showPartnershipModal(interaction);
   } catch (error) {
@@ -196,14 +134,7 @@ export const ButtonHandlerRegistry: { [key: string]: (interaction: ButtonInterac
   },
 
   'delete_ticket_manual': async (interaction, client) => {
-    const memberRoles = interaction.member?.roles;
-    let hasStaff = false;
-    if (Array.isArray(memberRoles)) {
-      hasStaff = memberRoles.includes(config.staffRoleId);
-    } else if (memberRoles && 'cache' in memberRoles) {
-      hasStaff = memberRoles.cache.has(config.staffRoleId);
-    }
-    if (!hasStaff) {
+    if (!memberHasRole(interaction.member, config.staffRoleId)) {
       await interaction.reply({ content: 'You are not authorized to delete tickets.', ephemeral: true });
       return;
     }
@@ -219,15 +150,8 @@ export const ButtonHandlerRegistry: { [key: string]: (interaction: ButtonInterac
     await interaction.showModal(modal);
   },
   'claim_ticket': async (interaction, client) => {
-    const memberRoles = interaction.member?.roles;
-    let hasStaff = false;
-    if (Array.isArray(memberRoles)) {
-      hasStaff = memberRoles.includes(config.staffRoleId);
-    } else if (memberRoles && 'cache' in memberRoles) {
-      hasStaff = memberRoles.cache.has(config.staffRoleId);
-    }
-    if (!hasStaff) {
-      await interaction.reply({ content: 'You are not d to claim tickets.', ephemeral: true });
+    if (!memberHasRole(interaction.member, config.staffRoleId)) {
+      await interaction.reply({ content: 'You are not authorized to claim tickets.', ephemeral: true });
       return;
     }
     const modal = new ModalBuilder()
@@ -252,6 +176,14 @@ export const ButtonHandlerRegistry: { [key: string]: (interaction: ButtonInterac
     if (!cached) {
       // Fallback: if cache not found, attempt to extract from embed.
       const embed = interaction.message.embeds[0];
+      if (!embed) {
+        await interaction.update({
+          content: 'This instructions preview expired. Please run the configuration command again.',
+          embeds: [],
+          components: [],
+        });
+        return;
+      }
       const newPreviewTitle = embed.title || `${ticketType} Ticket Preview`;
       const newInstructions = embed.description ? embed.description.replace(/```/g, '').trim() : '';
       instructionsCache.set(cacheKey, { instructions: newInstructions, previewTitle: newPreviewTitle });
@@ -279,7 +211,7 @@ export const ButtonHandlerRegistry: { [key: string]: (interaction: ButtonInterac
         components: []
       });
     } catch (error) {
-      logger.error('Error updating custom instructions:', error);
+      console.error('Error updating custom instructions:', error);
       await interaction.update({
         content: 'There was an error updating the custom instructions.',
         embeds: [],
