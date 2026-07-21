@@ -1,5 +1,4 @@
 import { SlashCommandBuilder, ChatInputCommandInteraction } from 'discord.js';
-import { getTicketMode, TicketMode } from '../utils/ticketModeSettings.js';
 import { handleClaimCommand } from '../handlers/ticketHandlers.js';
 
 const data = new SlashCommandBuilder()
@@ -13,10 +12,9 @@ const data = new SlashCommandBuilder()
   );
 
 async function execute(interaction: ChatInputCommandInteraction) {
-  // Check if the current ticket system uses threads.
-  if (getTicketMode() === TicketMode.THREAD_BASED) {
+  if (interaction.channel?.isThread()) {
     await interaction.reply({ 
-      content: 'Current Ticketing System is set to threads, so claim is not available.', 
+      content: 'Claim is only available for channel-based tickets.',
       ephemeral: true 
     });
     return;
@@ -25,10 +23,7 @@ async function execute(interaction: ChatInputCommandInteraction) {
   const reason = interaction.options.getString('reason', true);
 
   try {
-    // Call the claim handler.
-    // Note: The handler itself handles deferring the reply,
-    // checks for staff permission (using config.staffRoleId), and deletes the ticket channel.
-    await handleClaimCommand(interaction, reason, interaction.client);
+    await handleClaimCommand(interaction, reason);
   } catch (error) {
     console.error('Error executing claim command:', error);
     if (!interaction.deferred && !interaction.replied) {

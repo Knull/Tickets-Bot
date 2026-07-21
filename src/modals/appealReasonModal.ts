@@ -1,10 +1,9 @@
 import { ModalBuilder, TextInputBuilder, ActionRowBuilder, TextInputStyle, ModalSubmitInteraction } from 'discord.js';
-import { createTicketChannel } from '../handlers/ticketHandlers.js';
 import { createTicket } from '../handlers/ticketCreationDispatcher.js';
 /**
  * Shows the modal for appeal reasons for mute or strike appeals.
  */
-export function showAppealReasonModal(interaction: any, appealType: 'appeal_mute' | 'appeal_strike'): void {
+export async function showAppealReasonModal(interaction: { showModal(modal: ModalBuilder): Promise<unknown> }, appealType: 'appeal_mute' | 'appeal_strike'): Promise<void> {
   const modal = new ModalBuilder()
     .setCustomId(`appeal_reason_modal_${appealType}`)
     .setTitle(appealType === 'appeal_mute' ? 'Mute Appeal' : 'Strike Appeal');
@@ -17,30 +16,32 @@ export function showAppealReasonModal(interaction: any, appealType: 'appeal_mute
     .setCustomId('reason')
     .setLabel(label)
     .setStyle(TextInputStyle.Paragraph)
+    .setMaxLength(3_500)
     .setRequired(true);
     
   modal.addComponents(new ActionRowBuilder<TextInputBuilder>().addComponents(reasonInput));
-  interaction.showModal(modal);
+  await interaction.showModal(modal);
 }
 
 /**
  * Shows the modal for ban appeals.
  */
-export function showBanAppealModal(interaction: any, banType: 'screenshare_appeal' | 'strike_ban'): void {
+export async function showBanAppealModal(interaction: { showModal(modal: ModalBuilder): Promise<unknown> }, banType: 'screenshare_appeal' | 'strike_ban'): Promise<void> {
   const modal = new ModalBuilder()
     .setCustomId(`appeal_ban_modal_${banType}`)
     .setTitle('Ban Appeal');
     
-  const label = 'Why should you be unbanned?)';
+  const label = 'Why should you be unbanned?';
   
   const reasonInput = new TextInputBuilder()
     .setCustomId('reason')
     .setLabel(label)
     .setStyle(TextInputStyle.Paragraph)
+    .setMaxLength(3_500)
     .setRequired(true);
     
   modal.addComponents(new ActionRowBuilder<TextInputBuilder>().addComponents(reasonInput));
-  interaction.showModal(modal);
+  await interaction.showModal(modal);
 }
 
 /**

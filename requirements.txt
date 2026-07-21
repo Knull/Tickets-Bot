@@ -1,0 +1,2 @@
+discord.py>=2.6,<3
+chat-exporter>=2,<3

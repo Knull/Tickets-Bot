@@ -6,8 +6,12 @@ export async function confirmTicketConfigPermissions(interaction: ButtonInteract
   const ticketType = interaction.customId.replace('confirm_permissions_', '')
   const cacheKey = `${interaction.user.id}_${ticketType}`
   const selectedRoleIds: string[] | undefined = RoleSelectCache.get(cacheKey)
-  if (!selectedRoleIds || selectedRoleIds.length === 0) {
-    await interaction.update({ content: `Permissions for ${ticketType} tickets have been updated.`, components: [] })
+  if (!selectedRoleIds) {
+    await interaction.update({
+      content: 'This permissions selection expired. Please run `/ticket-config permissions` again.',
+      embeds: [],
+      components: [],
+    })
     return
   }
   try {

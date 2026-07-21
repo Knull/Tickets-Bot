@@ -1,6 +1,6 @@
 import { ChatInputCommandInteraction, ActionRowBuilder, StringSelectMenuBuilder, StringSelectMenuInteraction, EmbedBuilder, ButtonBuilder, ButtonStyle } from 'discord.js';
-import prisma from '../utils/database.js';
 import { RoleSelectCache } from '../utils/roleSelectCache.js';
+import config from '../config/config.js';
 
 export async function handleTicketConfigPermissions(interaction: ChatInputCommandInteraction): Promise<void> {
   const ticketType = interaction.options.getString('tickettype', true);
@@ -8,23 +8,7 @@ export async function handleTicketConfigPermissions(interaction: ChatInputComman
     await interaction.editReply({ content: 'Guild not found' });
     return;
   }
-  // hard coded for now  
-  const rolesToShow = [
-    "1228653981010497597",
-    "1325778907286212608",
-    "1338957456918708235",
-    "1228653981010497599",
-    "1228653981010497598",
-    "1228653981010497601",
-    "1228653981048377366",
-    "1228653981048377371",
-    "1345028092996882432",
-    "1228653981048377373",
-    "1228653981086257183",
-    "1228653981086257188",
-    "1228653981086257184",
-    "1228653981115355196"
-  ];
+  const roles = await interaction.guild.roles.fetch();
   
   const emojiPool = [
     "😀", "😃", "😄", "😁", "😆", "😅", "😂", "🤣", "😊", "😇",
@@ -32,8 +16,8 @@ export async function handleTicketConfigPermissions(interaction: ChatInputComman
     "😋", "😛", "😝", "😜", "🤪", "🤨", "🧐", "🤓", "😎", "🤩"
   ];
   
-  const options = rolesToShow.map(roleId => {
-    const role = interaction.guild!.roles.cache.get(roleId);
+  const options = config.configurableRoleIds.map(roleId => {
+    const role = roles.get(roleId);
     if (!role) return null;
     let label = role.name;
     if (label.length > 25) {
@@ -49,13 +33,20 @@ export async function handleTicketConfigPermissions(interaction: ChatInputComman
       emoji: { name: randomEmoji }
     };
   }).filter(o => o !== null) as { label: string; value: string; description: string; emoji?: { name: string; id?: string } }[];
+
+  if (options.length === 0) {
+    await interaction.editReply({
+      content: 'None of the configurable roles exist in this guild. Check `CONFIGURABLE_ROLE_IDS`.',
+    });
+    return;
+  }
   
   const selectMenu = new StringSelectMenuBuilder()
     .setCustomId(`config_permissions_${ticketType}`)
     .setPlaceholder(`Select roles for ${ticketType} tickets`)
     .addOptions(options)
     .setMinValues(0)
-    .setMaxValues(options.length); 
+    .setMaxValues(Math.min(options.length, 25));
 
   const row = new ActionRowBuilder<StringSelectMenuBuilder>().addComponents(selectMenu);
 

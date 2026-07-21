@@ -1,5 +1,4 @@
 import { SlashCommandBuilder, ChatInputCommandInteraction } from 'discord.js';
-import { getTicketMode, TicketMode } from '../utils/ticketModeSettings.js';
 import { handleCloseCommand } from '../handlers/ticketHandlers.js';
 import { handleCloseThreadCommand } from '../handlers/threadTicketHandlers.js';
 
@@ -9,8 +8,9 @@ const data = new SlashCommandBuilder()
 
 async function execute(interaction: ChatInputCommandInteraction) {
   try {
-    // Choose the correct handler based on the ticket mode.
-    if (getTicketMode() === TicketMode.THREAD_BASED) {
+    // Existing tickets remain closable after an administrator changes the
+    // creation mode. Route by the current channel, not the global setting.
+    if (interaction.channel?.isThread()) {
       await handleCloseThreadCommand(interaction);
     } else {
       await handleCloseCommand(interaction);

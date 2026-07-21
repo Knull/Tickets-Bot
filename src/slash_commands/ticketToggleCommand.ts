@@ -7,10 +7,16 @@ import {
     ButtonStyle,
     EmbedBuilder,
     ButtonInteraction,
-    GuildMemberRoleManager,
   } from 'discord.js';
   import { setTicketMode, TicketMode } from '../utils/ticketModeSettings.js';
-  import { getAllowedRoleIds } from '../utils/getAllowedRoleIds.js';
+  import config from '../config/config.js';
+  import { memberHasAnyRole } from '../utils/memberRoles.js';
+
+  const allowedRoleIds = [config.adminRoleId, config.managerRoleId, config.ownerRoleId] as const;
+
+  function isAuthorized(interaction: ChatInputCommandInteraction | ButtonInteraction): boolean {
+    return memberHasAnyRole(interaction.member, allowedRoleIds);
+  }
   
   const data = new SlashCommandBuilder()
     .setName('ticket-toggle')
@@ -27,22 +33,7 @@ import {
     );
   
   async function execute(interaction: ChatInputCommandInteraction): Promise<void> {
-    const allowedRoleIds = await getAllowedRoleIds();
-  
-    if (!interaction.member || !('roles' in interaction.member)) {
-      await interaction.reply({ content: 'You are not authorized to use this command.', ephemeral: true });
-      return;
-    }
-  
-    const memberRoles = interaction.member.roles;
-    let isAllowed = false;
-    if (memberRoles instanceof GuildMemberRoleManager) {
-      isAllowed = allowedRoleIds.some(roleId => memberRoles.cache.has(roleId));
-    } else if (Array.isArray(memberRoles)) {
-      isAllowed = allowedRoleIds.some(roleId => memberRoles.includes(roleId));
-    }
-  
-    if (!isAllowed) {
+    if (!isAuthorized(interaction)) {
       await interaction.reply({ content: 'You are not authorized to use this command.', ephemeral: true });
       return;
     }
@@ -50,7 +41,7 @@ import {
     const modeOption = interaction.options.getString('mode', true);
   
     if (modeOption === 'channel') {
-      setTicketMode(TicketMode.CHANNEL_BASED, false);
+      await setTicketMode(TicketMode.CHANNEL_BASED, false);
       await interaction.editReply({ content: 'Ticketing mode has been set to **channel based**.' });
     } else if (modeOption === 'thread') {
       const queryEmbed = new EmbedBuilder()
@@ -85,19 +76,7 @@ import {
    * Handles the initial button click for the ping query
    */
   export async function handleTicketToggleButton(interaction: ButtonInteraction): Promise<void> {
-    const allowedRoleIds = await getAllowedRoleIds();
-    if (!interaction.member || !('roles' in interaction.member)) {
-      await interaction.reply({ content: 'You are not authorized to perform this action.', ephemeral: true });
-      return;
-    }
-    const memberRoles = interaction.member.roles;
-    let isAllowed = false;
-    if (memberRoles instanceof GuildMemberRoleManager) {
-      isAllowed = allowedRoleIds.some(roleId => memberRoles.cache.has(roleId));
-    } else if (Array.isArray(memberRoles)) {
-      isAllowed = allowedRoleIds.some(roleId => memberRoles.includes(roleId));
-    }
-    if (!isAllowed) {
+    if (!isAuthorized(interaction)) {
       await interaction.reply({ content: 'You are not authorized to perform this action.', ephemeral: true });
       return;
     }
@@ -129,13 +108,13 @@ import {
    * Handles the confirmation button interaction.
    */
   export async function handleTicketToggleConfirm(interaction: ButtonInteraction): Promise<void> {
-    if (!interaction.member || !('roles' in interaction.member)) {
+    if (!isAuthorized(interaction)) {
       await interaction.reply({ content: 'You are not authorized.', ephemeral: true });
       return;
     }
     const customId = interaction.customId; // 'ticket_toggle_confirm_yes' or 'ticket_toggle_confirm_no'
     const pingRoles = customId.includes('yes');
-    setTicketMode(TicketMode.THREAD_BASED, pingRoles);
+    await setTicketMode(TicketMode.THREAD_BASED, pingRoles);
     await interaction.update({
       content: `Ticketing mode has been set to **thread based** with role ping ${pingRoles ? 'enabled' : 'disabled'}.`,
       embeds: [],
@@ -149,6 +128,5 @@ import {
   export async function handleTicketToggleCancel(interaction: ButtonInteraction): Promise<void> {
     await interaction.update({ content: 'Ticket toggle operation cancelled.', embeds: [], components: [] });
   }
-  
+
   export default { data, execute, autocomplete };
-  
