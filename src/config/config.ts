@@ -1,7 +1,10 @@
 
 // src/config/config.ts
+// The bot token is read from the environment (see .env.example); never commit it.
+import 'dotenv/config';
+
 export default {
-    token: 'MTM1NTk2NDMzMjk1NzExMDQ1Ng.GWU0je.9CqUsQCiV-uB7krPsKC_IhCGF2fPhYn-7HdK-0',
+    token: process.env.DISCORD_TOKEN ?? '',
     ticketsChannelId: '1238583192047325234',
     ticketsChannelId2: '1355964984550756352',
     generalTicketsCategoryId: '1340718323368726629',

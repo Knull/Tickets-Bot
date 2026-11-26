@@ -20,7 +20,7 @@ A  Discord bot that manages tickets for the PikaNetwork Ranked Bedwars community
    ```bash
    npm install
    ```
-2. Configure the bot in `src/config/config.ts` and set `DATABASE_URL` in your environment or `.env`.
+2. Copy `.env.example` to `.env` and set `DISCORD_TOKEN` and `DATABASE_URL`. Set the guild, channel and role IDs in `src/config/config.ts`.
 3. Generate the Prisma client and apply the schema:
    ```bash
    npx prisma generate

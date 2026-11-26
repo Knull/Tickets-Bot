@@ -1,4 +1,10 @@
-/src/transcripts/venv
+node_modules/
+dist/
+
+# secrets
+.env
+**/.env
+
+# python
 *.pyc
-/src/transcripts/venv
 /src/transcripts/venv
